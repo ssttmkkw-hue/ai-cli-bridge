@@ -4,7 +4,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, execFileSync } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process');
 
 const VERSION = '1.0.0';
 const cfgPath = path.resolve(process.argv[2] || process.env.AGENT_CONFIG || path.join(__dirname, 'agent.config.json'));
@@ -78,6 +78,28 @@ function findBin(kind) {
 function versionOf(bin) {
   try { return execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 15000, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] }).trim().split('\n')[0]; }
   catch (e) { return null; }
+}
+
+// 是否已登录：claude auth status（JSON，loggedIn）/ codex login status（退出码 0 = 已登录）
+// 返回 true / false；命令不支持、超时等判断不了的情况返回 null（当作「不知道」，不拦）
+const AUTH_ARGS = { claude: ['auth', 'status'], codex: ['login', 'status'], mock: ['auth', 'status'] };
+function parseAuth(kind, err, stdout, stderr) {
+  const out = String(stdout || '') + '\n' + String(stderr || '');
+  if (kind === 'claude' || kind === 'mock') {
+    const m = String(stdout || '').match(/\{[\s\S]*\}/);
+    if (m) { try { const j = JSON.parse(m[0]); if (typeof j.loggedIn === 'boolean') return { loggedIn: j.loggedIn, method: j.authMethod || null }; } catch {} }
+  }
+  if (/not logged in|not signed in|未登录|please (log|sign) ?in|login required/i.test(out)) return { loggedIn: false };
+  if (!err) return { loggedIn: true };
+  // 退出码非 0、但看不出原因（老版本没有这个子命令、超时……）：不下结论
+  if (err.killed || err.code === 'ETIMEDOUT' || /unknown|unrecognized|unexpected argument|invalid/i.test(out)) return null;
+  return kind === 'codex' && typeof err.code === 'number' ? { loggedIn: false } : null;
+}
+function authOf(kind, bin, prefixArgs = []) {
+  const args = AUTH_ARGS[kind];
+  if (!args || !bin) return Promise.resolve(null);
+  return new Promise(resolve => execFile(bin, [...prefixArgs, ...args], { encoding: 'utf8', timeout: 20000, env: childEnv(), windowsHide: true },
+    (err, stdout, stderr) => resolve(parseAuth(kind, err, stdout, stderr))));
 }
 
 // 子进程环境：去掉宿主 Claude Code 注入的变量，避免嵌套调用时继承宿主身份/配置
@@ -225,13 +247,35 @@ const clis = {};
 for (const [kind, c] of Object.entries(cfg.clis || { claude: {}, codex: {} })) {
   if (c.enabled === false) continue;
   if (kind === 'mock') {
-    clis.mock = { ok: true, bin: process.execPath, prefixArgs: [path.join(__dirname, '..', 'scripts', 'mock-cli.js')], version: 'mock' };
+    clis.mock = { ok: true, bin: process.execPath, prefixArgs: [path.join(__dirname, '..', 'scripts', 'mock-cli.js')], version: 'mock', auth: null };
     continue;
   }
   const bin = c.bin && c.bin !== 'auto' ? expandHome(c.bin) : findBin(kind);
   const version = bin ? versionOf(bin) : null;
-  clis[kind] = { ok: !!(bin && version), bin, version, models: c.models || [], prefixArgs: [] };
+  clis[kind] = { ok: !!(bin && version), bin, version, models: c.models || [], prefixArgs: [], auth: null };
 }
+// 登录状态：启动时查一次，之后每 5 分钟、以及任务失败后再查；变了就告诉中继（在 Mac 上登录后不用重启 agent）
+const authLabel = c => c.auth?.loggedIn === false ? '未登录' : c.auth?.loggedIn ? '已登录' : '登录状态未知';
+async function refreshAuth(log) {
+  let changed = false;
+  await Promise.all(Object.entries(clis).map(async ([kind, c]) => {
+    if (!c.ok || !AUTH_ARGS[kind]) return;
+    const a = await authOf(kind, c.bin, c.prefixArgs);
+    if (a === null && c.auth) return; // 这次没查出来，保留上次的结果
+    if (JSON.stringify(a) !== JSON.stringify(c.auth)) { c.auth = a; changed = true; if (log) console.log(`[agent]   ${kind}: ${authLabel(c)}`); }
+  }));
+  return changed;
+}
+let authTimer = null;
+function scheduleAuthCheck(delay) {
+  clearTimeout(authTimer);
+  authTimer = setTimeout(async () => {
+    try { if (await refreshAuth(true)) await api('POST', '/api/agent/clis', { agent: cfg.name, clis: publicClis() }); }
+    catch (e) { /* 中继暂时连不上：下次 hello 会带上 */ }
+    scheduleAuthCheck(5 * 60000);
+  }, delay);
+}
+const publicClis = () => Object.fromEntries(Object.entries(clis).map(([k, c]) => [k, { ok: c.ok, version: c.version, models: c.models, loggedIn: c.auth ? c.auth.loggedIn : null }]));
 
 // isolate: true → 每个对话在 <目录>/<用户名>/<对话id>/ 里运行，同一目录的多个任务可以同时跑、产出互不串
 const workspaces = (cfg.workspaces || []).map(w => ({ name: w.name, path: path.resolve(expandHome(w.path)), maxLevel: w.maxLevel || 'full', note: w.note || '', isolate: !!w.isolate }));
@@ -240,6 +284,10 @@ if (!workspaces.length) { console.error('[agent] 至少配置一个 workspaces')
 
 console.log(`[agent] ${cfg.name} → ${cfg.relayUrl}`);
 for (const [k, c] of Object.entries(clis)) console.log(`[agent]   ${k}: ${c.ok ? '✓ ' + c.version : '✗ 未找到或无法运行'}  ${c.bin || ''}`);
+const authReady = refreshAuth(false).then(() => {
+  for (const [k, c] of Object.entries(clis)) if (c.ok && AUTH_ARGS[k]) console.log(`[agent]   ${k}: ${authLabel(c)}${c.auth?.loggedIn === false ? `（在这台电脑的终端里运行 ${k === 'codex' ? 'codex login' : 'claude 按提示登录'}）` : ''}`);
+  scheduleAuthCheck(5 * 60000);
+});
 
 // ---------------------------------------------------------------- 与中继通信
 async function api(method, p, body, signal) {
@@ -280,13 +328,14 @@ async function hello() {
   await api('POST', '/api/agent/hello', {
     name: cfg.name, platform: process.platform, hostname: os.hostname(), version: VERSION,
     maxConcurrent: cfg.maxConcurrent, running: [...running.keys()], confine: CONFINE,
-    clis: Object.fromEntries(Object.entries(clis).map(([k, c]) => [k, { ok: c.ok, version: c.version, models: c.models }])),
+    clis: publicClis(),
     workspaces: workspaces.map(({ name, maxLevel, note, isolate }) => ({ name, maxLevel, note, isolate })),
   });
 }
 
 let pollAbort = null;
 async function loop() {
+  await authReady;
   let backoff = 1000, greeted = false;
   for (;;) {
     try {
@@ -418,6 +467,8 @@ async function fsGet(pr) {
 function runProbe(pr) {
   if (pr.kind === 'ls') { try { probeReply(pr.id, fsList(pr)); } catch (e) { probeReply(pr.id, null, e.message); } return; }
   if (pr.kind === 'get') { fsGet(pr).catch(e => probeReply(pr.id, null, e.message)); return; }
+  // 网页发消息时发现 CLI 未登录：马上复查一次（可能刚在 Mac 上登录好）
+  if (pr.kind === 'auth') { refreshAuth(true).then(() => probeReply(pr.id, { clis: publicClis() }), e => probeReply(pr.id, null, e.message)); return; }
   if (pr.kind !== 'usage') return reportQuota(null, pr.id, '不支持的查询');
   const c = clis.claude;
   if (!c?.ok) return reportQuota(null, pr.id, '这台设备没有可用的 Claude Code');
@@ -431,7 +482,9 @@ function runProbe(pr) {
   child.on('close', () => {
     let text = out; try { text = JSON.parse(out).result || out; } catch {}
     const q = quotaFromUsageText(text);
-    end(q, q ? null : '没能从 /usage 的输出里读出额度：' + short(text, 200));
+    // 用 API Key 登录（按用量计费）时 /usage 只有费用，没有 5 小时 / 本周额度
+    const api = !q && /Estimated cost|Total cost/i.test(text);
+    end(q, q ? null : api ? '这台电脑上的 Claude Code 按 API 计费，没有 5 小时 / 本周额度' : '没能从 /usage 的输出里读出额度：' + short(text, 200));
   });
   child.stdin.on('error', () => {}); child.stdin.end('/usage');
 }
@@ -767,6 +820,7 @@ async function startTask(t) {
     } catch (e) { console.error('[agent] 收集产出失败', e); }
     console.log(`[agent] ■ ${new Date().toISOString().slice(11, 23)} ${t.id} ${status}${error ? ' - ' + short(error, 120) : ''}`);
     finish({ status, result: st.result, error, exitCode: code });
+    if (status === 'failed' && AUTH_ARGS[t.cli]) scheduleAuthCheck(2000); // 可能是登录过期了，马上复查
   };
 }
 

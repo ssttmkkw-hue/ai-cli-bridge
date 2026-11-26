@@ -8,7 +8,7 @@
 - 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
 - Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
 - Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
-- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 47 项，全部通过。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 51 项（含登录检测 4 项），全部通过。按 API 计费的 Claude 账号没有订阅额度，额度测试会自动跳过。
 
 ## 架构
 
@@ -37,6 +37,7 @@
 | 掉线 | 执行端 45 秒没轮询即视为离线；已派发的任务 90 秒没有回音就判失败；中继重启时正在跑的任务判失败 |
 | 文件 | `POST /api/agent/files`（agent 上传产出）、`GET /api/agent/files/:id`（agent 取附件）、`POST /api/uploads`（用户上传，需要 `X-Upload: 1` 头防 CSRF）、`GET /api/files/:id`（只有能看到这个任务的人能访问；HTML/SVG 带 `CSP: sandbox`） |
 | 环境变量账号 | 启动时 `syncEnvAccounts()`：`ADMIN_PASSWORD`、`GUEST1..5_PASSWORD`（`GUESTn_NAME` 改名）。账号带 `env` 标记（`ADMIN` / `GUESTn`），密码以环境变量为准（变了就 `kickUser()` 踢下线），环境变量没了就停用；这些账号在网页上不能改密码、不能删。访客默认权限 `GUEST_PERMS()`（只能用 Claude、最高 edit、每天 50 条） |
+| 登录检测 | `sanitizeClis()` 只留 `ok/version/models/loggedIn`。`ensureLoggedIn()`（建对话、发消息、重试时）：上次是 `loggedIn: false` 就先发 probe 让 agent 复查（最多等 25 秒），仍未登录才 400，管理员看到登录命令，其他人看到「请联系管理员」 |
 | 推送 | `/api/stream` SSE，事件 `task`（任务摘要，不含 events）、`chunk`（新增输出）、`agents`（设备列表，按接收者权限用 `visibleAgents()` 筛过：非管理员没有额度、电脑名、并发等） |
 | 即时查询（probe） | `requestProbe(a, { kind, ... })` 把请求塞进 agent 长轮询的返回值，agent 用 `/api/agent/probe`（JSON）或 `/api/agent/probe-file`（原始字节）带 `probeId` 回报。目前有 `usage`（额度）、`ls`（列目录）、`get`（取文件）。`/api/fs`、`/api/fs/file`：普通用户的根是 `<isolate 目录>/<用户名>/`，管理员是整个目录 |
 | 订阅额度 | agent 每个记录挂 `quota`（最近一次）和 `probes`（待执行的即时查询）。`POST /api/quota` → `requestProbe()` 把 `{kind:"usage"}` 塞进长轮询的返回值（`probes`），最多等 45 秒；带 `maxAge`（网页每 5 分钟的自动查询传 4 分钟）时数据够新直接返回缓存；同一时间只跑一次（`a.probing`），并发的请求共用结果；agent 跑完 `POST /api/agent/quota` 带 `probeId` 回来。agent 平时在任务输出里看到 `rate_limit_event` 也会上报（20 秒最多一次）。`sanitizeQuota()` 只留 `key/label/percent/resetsAt/resetsText/status` |
@@ -45,7 +46,8 @@
 ### agent/agent.js（执行端）
 | 部分 | 说明 |
 |---|---|
-| 找 CLI | `findBin()`：PATH → 常见安装位置（Mac：`~/.local/bin`、`/opt/homebrew/bin`…；Windows：Claude 桌面 App 自带的、Codex 安装目录）；`versionOf()` 只确认程序能跑，**不确认是否已登录** |
+| 找 CLI | `findBin()`：PATH → 常见安装位置（Mac：`~/.local/bin`、`/opt/homebrew/bin`…；Windows：Claude 桌面 App 自带的、Codex 安装目录）；`versionOf()` 只确认程序能跑 |
+| 登录检测 | `authOf()`：`claude auth status`（JSON 的 `loggedIn`）、`codex login status`（退出码 0 = 已登录），判断不了返回 `null`（不拦）。启动时查一次，之后每 5 分钟、任务失败 2 秒后再查，变了就 `POST /api/agent/clis`；中继也能用 probe `{kind:'auth'}` 让它马上复查。hello 里每个 CLI 带 `loggedIn: true/false/null` |
 | 子进程环境 | `childEnv()` 去掉宿主 Claude Code 注入的 `CLAUDE_CODE_*` 等变量；Mac 上补全 PATH（launchd 启动时 PATH 很短） |
 | 命令行 | `buildCommand()`：权限三档 → CLI 参数；prompt 一律走 stdin；Codex 图片附件用 `-i` |
 | 解析输出 | `makeParser()` 把两家的 JSON 行统一成事件 `text / tool / tool_out / think / info / err`，并记下会话 ID |
@@ -80,12 +82,12 @@
 
 ```bash
 npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
-node dev/smoke-test.mjs  # 另开终端，47 项冒烟测试，不花额度
+node dev/smoke-test.mjs  # 另开终端，51 项冒烟测试，不花额度
 node dev/env-accounts-test.mjs  # 环境变量账号（ADMIN_PASSWORD / GUESTn），自己起临时中继，不用先启动服务
 npm run check            # 只做语法检查
 ```
 
-- 模拟 CLI 是 `scripts/mock-cli.js`，输出格式和 `codex exec --json` 一样。prompt 里带「slow / 慢」会跑 10 秒（方便测停止），带「文件 / file」会生成 `chart.svg`、`report.html` 并修改 `notes.md`，带「fail / 报错」会失败。
+- 模拟 CLI 是 `scripts/mock-cli.js`，输出格式和 `codex exec --json` 一样。`test-workspaces/.mock-logged-out` 存在时模拟「未登录」。prompt 里带「slow / 慢」会跑 10 秒（方便测停止），带「文件 / file」会生成 `chart.svg`、`report.html` 并修改 `notes.md`，带「fail / 报错」会失败。
 - 真实 CLI 手动测：网页上新建对话选 Claude / Codex。
 - 预览端口默认 5227；管理员初始密码在 `data/INITIAL_ADMIN.txt`（Mac 上第一次启动会重新生成）。
 
@@ -93,7 +95,7 @@ npm run check            # 只做语法检查
 
 - **Codex 回答不逐字输出**：`codex exec --json` 只在整段写完时给出 `agent_message`。要逐字输出需要换成 `codex app-server`。
 - **每条消息都重启 CLI**：会慢几秒，并且要重新读一遍历史。
-- **CLI 是否「可用」只看能不能运行**：没登录的 CLI 也显示可用，发消息时才报错。
+- **登录检测依赖 CLI 子命令**：`claude auth status` / `codex login status` 不存在的老版本显示「登录状态未知」，不拦。
 - **内置预览面板（Claude 桌面 App）会拦截带 `sandbox` 属性的 iframe**，所以 HTML 预览改由服务端的 `CSP: sandbox` 响应头负责隔离，iframe 上不再加这个属性。普通浏览器两种写法都行。
 - **文件没有自动过期**：`data/files/` 只在删除对话时清理。
 - **Claude Code 的 `--permission-mode default` 不限制读取范围**：Read 工具能读工作目录以外的文件，所以靠 macOS 的 `sandbox-exec` 做文件夹限制（见上面「文件夹限制」）。Windows / Linux 上没有这层限制；Codex 和「完全放开」级别也没有。
@@ -109,14 +111,15 @@ npm run check            # 只做语法检查
 3. **在网页上批准操作**：Claude Code 的 `--permission-prompt-tool` 可以把「允许吗？」交给一个 MCP 工具处理，把它接到网页上做成「允许 / 拒绝」按钮。需要先确认它在 `-p` 模式下的行为。
 4. **常驻进程**：Claude 用 `--input-format stream-json`，Codex 用 `app-server`。好处是能中途插话、Codex 能逐字输出、省掉每次启动。
 5. **每条任务自动存档、可撤销**：任务前给工作目录存快照（比如目录是 git 仓库就用 `git stash create` 或单独的分支），网页上加「撤销这次改动」。
-6. 小改进：每条消息临时换模型、代码语法高亮、显示上下文用量、检测 CLI 是否已登录。
+6. 小改进：每条消息临时换模型、代码语法高亮、显示上下文用量。
 
 ## Mac 上的验证清单
 
 - [ ] `brew install node`，`node -v` ≥ 18
 - [ ] `claude` 登录；`codex login`
 - [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
-- [ ] `node dev/smoke-test.mjs` 47 项全过
+- [ ] `node dev/smoke-test.mjs` 51 项全过
+- [ ] 设备页 Claude / Codex 显示已登录；`claude auth logout` 后几分钟内变成「未登录」，发消息直接提示登录命令；重新登录后直接重发就能用
 - [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
 - [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
 - [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览

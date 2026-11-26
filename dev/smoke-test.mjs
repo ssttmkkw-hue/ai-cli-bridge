@@ -197,9 +197,10 @@ if (agent.confine && agent.workspaces?.find(w => w.name === WS)?.isolate) {
 ok((await fetch(B + '/api/quota')).status === 401
   && (await fetch(B + '/api/agent/quota', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agent: AGENT, quota: { windows: [{ key: 'five_hour', percent: 99 }] } }) })).status === 401,
   '额度：未登录看不到，没有 agent token 不能上报');
-if (agent.clis?.claude?.ok) {
-  const t0 = Date.now();
-  const q = (await A('POST', '/api/quota', { agent: AGENT })).j;
+const t0 = Date.now();
+const q = agent.clis?.claude?.ok ? (await A('POST', '/api/quota', { agent: AGENT })).j : null;
+if (/API 计费/.test(q?.error || '')) console.log('- 跳过额度测试：', q.error);
+else if (agent.clis?.claude?.ok) {
   const w = Object.fromEntries((q?.quota?.windows || []).map(x => [x.key, x]));
   ok(!q?.error && w.five_hour && w.seven_day && [w.five_hour, w.seven_day].every(x => x.percent >= 0 && x.percent <= 100 && x.resetsAt > Date.now() - 3600000),
     '额度：从 /usage 读出 5 小时和本周额度、恢复时间', q?.error || `5 小时 ${w.five_hour?.percent}%，本周 ${w.seven_day?.percent}%，${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -253,6 +254,25 @@ if (agent.workspaces?.find(w => w.name === WS)?.isolate) {
   ok((await fetch(B + '/api/fs')).status === 401, '我的文件：未登录不能看');
 } else console.log('- 跳过「我的文件」测试：', WS, '没开 isolate');
 ok((await fetch(B + '/api/agent/poll?name=x', { headers: { Authorization: 'Bearer nope' } })).status === 401, '错误的 agent token 被拒');
+
+// 登录检测：模拟 CLI 在 test-workspaces/.mock-logged-out 存在时报「未登录」
+{
+  const flag = path.join(ROOT, 'test-workspaces', '.mock-logged-out');
+  const mockAuth = async () => (await A('GET', '/api/agents')).j.agents.find(a => a.name === AGENT)?.clis?.mock?.loggedIn;
+  ok(await mockAuth() === true, '登录检测：执行端报告模拟 CLI 已登录');
+  fs.writeFileSync(flag, '');
+  try {
+    const tf = (await A('POST', `/api/convs/${conv.id}/send`, { prompt: '登录过期了' })).j.task;
+    const rf = await waitTask(A, tf.id);
+    let st; for (let i = 0; i < 40 && (st = await mockAuth()) !== false; i++) await sleep(250);
+    ok(rf?.status === 'failed' && st === false, '登录检测：任务因未登录失败后，执行端马上复查并报告「未登录」', rf?.error);
+    const rej = await A('POST', `/api/convs/${conv.id}/send`, { prompt: '还没登录' });
+    ok(rej.status === 400 && /没登录/.test(rej.j?.error || ''), '登录检测：未登录时发消息直接提示怎么登录，不排队', rej.j?.error);
+  } finally { fs.rmSync(flag, { force: true }); }
+  const back = await A('POST', `/api/convs/${conv.id}/send`, { prompt: '登录好了' });
+  const rb = back.j?.task && await waitTask(A, back.j.task.id);
+  ok(back.status === 200 && rb?.status === 'done' && await mockAuth() === true, '登录检测：登录后直接重发就能用（中继先让执行端复查）', back.j?.error);
+}
 
 // 清理
 const uid = (await A('GET', '/api/users')).j.users.find(u => u.username === name).id;

@@ -343,7 +343,10 @@ function draftChoice(agent) {
     S.draft = { cli: CLI_CHOICES.includes(last.cli) ? last.cli : DEFAULT_CHOICE.cli, model: last.model ?? DEFAULT_CHOICE.model };
   }
   const ok = k => !!agent?.clis?.[k]?.ok;
-  if (agent && !ok(S.draft.cli)) { const k = CLI_CHOICES.find(ok); if (k) S.draft = { cli: k, model: null }; }
+  const ready = k => ok(k) && agent.clis[k].loggedIn !== false;
+  // 默认选中的 CLI 不能用（没装 / 没登录）时换成能用的；手动点选的不改，发送时会提示怎么登录
+  if (agent && !ok(S.draft.cli)) { const k = CLI_CHOICES.find(ready) || CLI_CHOICES.find(ok); if (k) S.draft = { cli: k, model: null }; }
+  else if (agent && !S.draft.picked && !ready(S.draft.cli)) { const k = CLI_CHOICES.find(ready); if (k) S.draft = { cli: k, model: null }; }
   const models = modelChoices(S.draft.cli, agent);
   if (!models.some(([v]) => v === (S.draft.model ?? ''))) S.draft.model = S.draft.cli === 'claude' ? DEFAULT_CHOICE.model : models[0][0];
   return S.draft;
@@ -356,11 +359,11 @@ function renderNewChat() {
     ${(() => {
       const list = CLI_CHOICES.filter(k => isAdmin() || a?.clis?.[k]?.ok); // 中继已经按权限筛过 clis
       if (!isAdmin() && list.length <= 1) return '';
-      return pillsHTML('cli', list.map(k => { const c = a?.clis?.[k]; return [k, CLI_NAME[k], !c?.ok, !c ? '不可用' : c.ok ? '' : '未安装']; }), d.cli);
+      return pillsHTML('cli', list.map(k => { const c = a?.clis?.[k]; return [k, CLI_NAME[k], !c?.ok, !c ? '不可用' : !c.ok ? '未安装' : c.loggedIn === false ? '未登录' : '']; }), d.cli);
     })()}
     ${pillsHTML('model', modelChoices(d.cli, a), d.model ?? '')}
   </div>`;
-  el.querySelectorAll('[data-cli]').forEach(b => b.onclick = () => { S.draft = { cli: b.dataset.cli, model: null }; renderNewChat(); });
+  el.querySelectorAll('[data-cli]').forEach(b => b.onclick = () => { S.draft = { cli: b.dataset.cli, model: null, picked: true }; renderNewChat(); });
   el.querySelectorAll('[data-model]').forEach(b => b.onclick = () => { S.draft.model = b.dataset.model; renderNewChat(); });
 }
 // 目录和权限不让选：自动用这台 Mac 上「每个对话独立文件夹」的目录，权限给到允许的最高一级（实际访问由 Mac 上的文件夹限制兜住）
@@ -723,7 +726,7 @@ function viewAgents(m) {
     <div class="agents">${S.agents.length ? S.agents.map(a => `<div class="card agent">
       <h4><span class="dot ${a.online ? 'on' : ''}"></span>${esc(a.name)}</h4>
       <div class="faint" style="margin-bottom:8px">${esc(a.platform)} · ${esc(a.hostname || '')} · ${a.online ? '在线' : '离线，最后在线 ' + fmtTime(a.lastSeen)}</div>
-      ${Object.entries(a.clis).map(([k, c]) => `<div class="row"><span>${esc(CLI_NAME[k] || k)}</span><span class="${c.ok ? '' : 'faint'}">${c.ok ? esc(c.version) : '不可用'}</span></div>`).join('')}
+      ${Object.entries(a.clis).map(([k, c]) => `<div class="row"><span>${esc(CLI_NAME[k] || k)}</span><span class="${c.ok ? '' : 'faint'}">${c.ok ? esc(c.version) : '不可用'}${c.ok && c.loggedIn === false ? ' · <b class="warn">未登录</b>' : ''}</span></div>${c.ok && c.loggedIn === false && admin ? `<div class="faint" style="font-size:12px;margin:-2px 0 6px">在 Mac 终端里运行 <code>${k === 'codex' ? 'codex login' : 'claude'}</code> 登录，几分钟内自动更新，或者直接发消息会马上复查</div>` : ''}`).join('')}
       <div class="row"><span>并发</span><span>${a.running.length} / ${a.maxConcurrent}</span></div>
       <div class="row"><span>文件夹限制</span><span class="${a.confine ? '' : 'faint'}">${a.confine ? '开' : '关'}</span></div>
       <div class="row" style="display:block"><span>工作目录</span><div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${a.workspaces.map(w => `<span class="chip lv-${w.maxLevel}" title="${esc(w.note)}">📁 ${esc(w.name)}</span>`).join('')}</div></div>

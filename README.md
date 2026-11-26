@@ -30,7 +30,7 @@ agent 是**主动连出去**领任务的，所以 Mac 放在家里路由器后�
 | `mac/install-mac.sh` | 在 Mac 上装成开机自启服务（launchd） |
 | `scripts/start-local.js` | 本地联调：一条命令同时起中继 + agent |
 | `scripts/mock-cli.js` | 假 CLI，不花额度测试整条链路 |
-| `dev/smoke-test.mjs` | 冒烟测试（47 项，只用假 CLI） |
+| `dev/smoke-test.mjs` | 冒烟测试（51 项，只用假 CLI） |
 | `docs/DEVELOPMENT.md` | 开发交接：代码地图、已知问题、下一步计划、Mac 验证清单 |
 | `data/` | 运行后生成：`config.json`（agent token）、`users.json`、`db.json`、`sessions.json`（登录会话）、`files/`（产出与附件）、`INITIAL_ADMIN.txt` |
 
@@ -42,7 +42,7 @@ npm run local        # 等同于 node scripts/start-local.js 5227
 
 打开 http://localhost:5227 ，管理员账号 `admin`，初始密码在 `data/INITIAL_ADMIN.txt`。
 本地联调会自动生成 `agent/agent.local.json`，带一个「模拟 CLI」和两个测试目录（`test-workspaces/sandbox` 可写、`test-workspaces/readonly` 只读）。
-另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 47 项功能，不花额度。
+另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 51 项功能，不花额度。
 
 ## 二、部署到 Mac Air
 
@@ -156,6 +156,10 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 
 已有对话所在的目录改成 `isolate` 后，它的工作目录会变成新的子文件夹；Claude Code 的会话按目录保存，所以这类对话的下一条消息会自动开新会话。
 对话设置里可以「清空上下文」，下一条消息开新会话。
+
+### 登录检测
+
+执行端会查 Mac 上的 Claude Code / Codex 有没有登录（`claude auth status`、`codex login status`），每 5 分钟和任务失败后各查一次。没登录时「设备」页显示**未登录**，发消息会直接提示怎么登录（访客看到的是「请联系管理员」）；在 Mac 上登录好后直接重发即可，不用重启任何东西。
 
 ### 我的文件
 

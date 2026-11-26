@@ -2,6 +2,12 @@
 'use strict';
 const crypto = require('crypto');
 const args = process.argv.slice(2);
+// 模拟「未登录」：这个文件存在时，auth status 报未登录，正常调用也按 Claude 的样子报错
+const loggedOut = require('fs').existsSync(process.env.MOCK_LOGGED_OUT_FILE || require('path').join(__dirname, '..', 'test-workspaces', '.mock-logged-out'));
+if (args[0] === 'auth' && args[1] === 'status') {
+  process.stdout.write(JSON.stringify({ loggedIn: !loggedOut, authMethod: loggedOut ? 'none' : 'mock' }, null, 2) + '\n');
+  process.exit(loggedOut ? 1 : 0);
+}
 const ri = args.indexOf('--resume');
 const thread = ri >= 0 ? args[ri + 1] : crypto.randomUUID();
 let input = '';
@@ -12,6 +18,7 @@ process.stdin.on('end', async () => {
   const wait = ms => new Promise(r => setTimeout(r, ms));
   out({ type: 'thread.started', thread_id: thread });
   out({ type: 'turn.started' });
+  if (loggedOut) { out({ type: 'turn.failed', error: { message: 'Not logged in · Please run /login' } }); process.exit(1); }
   if (/fail|报错/.test(input)) { out({ type: 'turn.failed', error: { message: '模拟失败' } }); process.exit(1); }
   out({ type: 'item.started', item: { type: 'command_execution', command: 'ls -la' } });
   await wait(400);

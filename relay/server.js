@@ -435,7 +435,7 @@ async function handle(req, res) {
       const old = agents.get(b.name);
       const a = {
         name: String(b.name).slice(0, 40), platform: b.platform, hostname: b.hostname, version: b.version,
-        clis: b.clis || {}, workspaces: b.workspaces || [], maxConcurrent: b.maxConcurrent || 1, confine: !!b.confine,
+        clis: sanitizeClis(b.clis), workspaces: b.workspaces || [], maxConcurrent: b.maxConcurrent || 1, confine: !!b.confine,
         quota: old?.quota || null, probes: old?.probes || [], // 订阅额度（最近一次）、待执行的即时查询
         lastSeen: Date.now(), running: old?.running || new Set(), waiter: null,
       };
@@ -479,6 +479,13 @@ async function handle(req, res) {
       a.waiter = finish;
       req.on('close', () => { done = true; clearTimeout(timer); if (a.waiter === finish) a.waiter = null; });
       return;
+    }
+    // agent 复查登录状态后发现变了（例如在 Mac 上刚登录 / 登录过期）
+    if (p === '/api/agent/clis' && m === 'POST') {
+      const b = await readBody(req);
+      const a = agents.get(b.agent); if (!a) fail(409, '请先 hello');
+      a.clis = sanitizeClis(b.clis); pushAgents();
+      return send(res, 200, { ok: true });
     }
     // agent 上报订阅额度：任务里顺带看到的，或者回复网页的即时查询（probeId）
     if (p === '/api/agent/quota' && m === 'POST') {
@@ -647,6 +654,7 @@ async function handle(req, res) {
   if (p === '/api/convs' && m === 'POST') {
     const b = await readBody(req);
     checkRunPerms(user, b);
+    await ensureLoggedIn(user, b.agent, b.cli);
     const c = {
       id: newId('c'), userId: user.id, title: String(b.title || '新对话').slice(0, 60),
       agent: b.agent, cli: b.cli, workspace: b.workspace, level: b.level, model: b.model ? String(b.model).slice(0, 100) : null,
@@ -693,6 +701,7 @@ async function handle(req, res) {
     checkRunPerms(user, c);
     const lim = user.perms.dailyLimit || 0;
     if (lim > 0 && tasksToday(user.id) >= lim) fail(429, `今日额度已用完（${lim} 次）`);
+    await ensureLoggedIn(user, c.agent, c.cli);
     if (c.title === '新对话' && prompt) c.title = prompt.replace(/\s+/g, ' ').slice(0, 30);
     const t = {
       id: newId('t'), convId: c.id, userId: user.id, agent: c.agent, cli: c.cli, workspace: c.workspace,
@@ -732,6 +741,7 @@ async function handle(req, res) {
       const c = convOf(t); if (!c) fail(400, '对话已删除');
       if (t.userId !== user.id) fail(403, '只能重试自己的任务');
       checkRunPerms(user, c);
+      await ensureLoggedIn(user, c.agent, c.cli);
       const nt = { ...t, id: newId('t'), status: 'queued', createdAt: Date.now(), events: [], result: undefined, error: null,
         startedAt: undefined, endedAt: undefined, cancelRequested: false, outputSize: 0, truncated: false, sessionId: undefined,
         outputs: undefined, linkMap: undefined, usage: undefined, cancelRequestedAt: undefined, cancelSentAt: undefined, exitCode: undefined };
@@ -928,6 +938,32 @@ function sanitizeOutputs(list, t) {
       note: f.note ? str(f.note, 200) : undefined,
     };
   });
+}
+function sanitizeClis(v) {
+  const out = {};
+  for (const [k, c] of Object.entries(v && typeof v === 'object' ? v : {}).slice(0, 10)) {
+    if (!/^[\w-]{1,20}$/.test(k) || !c || typeof c !== 'object') continue;
+    out[k] = {
+      ok: !!c.ok, version: c.version ? String(c.version).slice(0, 80) : null,
+      models: Array.isArray(c.models) ? c.models.map(String).slice(0, 20) : [],
+      loggedIn: typeof c.loggedIn === 'boolean' ? c.loggedIn : null, // null = 不知道（老版本 agent、命令不支持）
+    };
+  }
+  return out;
+}
+const CLI_LABEL = { claude: 'Claude Code', codex: 'Codex', mock: '模拟 CLI' };
+const LOGIN_HINT = { claude: '在 Mac 终端里运行 claude，按提示登录', codex: '在 Mac 终端里运行 codex login', mock: '删掉 test-workspaces/.mock-logged-out' };
+// 上次查到「未登录」时，先让 agent 马上复查一次（可能刚登录好），仍未登录才拒绝
+async function ensureLoggedIn(user, agentName, cli) {
+  const a = agents.get(agentName);
+  if (a?.clis[cli]?.loggedIn !== false) return;
+  if (agentOnline(a)) {
+    const r = await requestProbe(a, { kind: 'auth' }, 25000);
+    if (r.result?.clis) { a.clis = sanitizeClis(r.result.clis); pushAgents(); }
+    if (a.clis[cli]?.loggedIn !== false) return;
+  }
+  const name = CLI_LABEL[cli] || cli;
+  fail(400, user.role === 'admin' ? `Mac 上的 ${name} 还没登录：${LOGIN_HINT[cli] || '先登录'}，登录后直接重发，不用重启` : `Mac 上的 ${name} 暂时不能用（未登录），请联系管理员`);
 }
 function checkRunPerms(user, b) {
   const a = agents.get(b.agent);

@@ -285,3 +285,4 @@ pre.code-view .ln { display: inline-block; width: 3.2em; color: var(--faint); us
   .page { padding: 16px 12px; }
   .hide-m { display: none; }
 }
+b.warn { color: var(--warn); font-weight: 600; }
