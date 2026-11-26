@@ -306,12 +306,13 @@ function viewChat(m) {
     <aside class="side ${S.sideOpen ? 'open' : ''}" id="side">
       <div class="side-head"><button class="btn primary" id="newConv">＋ 新对话</button></div>
       <div class="convs" id="convList"></div>
-      <div class="side-foot"><a class="btn" href="/api/export" download title="所有对话打成一个 zip，解压后双击 index.html 查看">⬇ 备份全部对话</a></div>
+      <div class="side-foot"><button class="btn" id="filesBtn" title="浏览、下载 Mac 上你的文件夹里的文件">📁 我的文件</button><a class="btn" href="/api/export" download title="所有对话打成一个 zip，解压后双击 index.html 查看">⬇ 备份</a></div>
     </aside>
     <div class="side-mask ${S.sideOpen ? 'open' : ''}" id="sideMask"></div>
     <section class="chat" id="chat"></section>`;
   $('#newConv').onclick = () => { setSide(false); S.conv = null; S.tasks = new Map(); S.draft = null; renderConvList(); renderChat(); $('#input')?.focus(); };
   $('#sideMask').onclick = () => setSide(false);
+  $('#filesBtn').onclick = () => { setSide(false); filesDialog(); };
   renderConvList();
   renderChat();
 }
@@ -389,7 +390,8 @@ function renderChat() {
       <button class="icon-btn menu-btn" id="menuBtn">☰</button>
       <div style="min-width:0;flex:1">
         <div class="title">${c ? esc(c.title) : '新对话'}</div>
-        ${c ? `<div class="meta">${deviceChip(S.agents.find(a => a.name === c.agent))}<span class="chip">${esc(CLI_NAME[c.cli] || c.cli)} · ${esc(modelLabel(c.cli, c.model))}</span></div>` : ''}
+        ${c ? `<div class="meta">${deviceChip(S.agents.find(a => a.name === c.agent))}<span class="chip">${esc(CLI_NAME[c.cli] || c.cli)} · ${esc(modelLabel(c.cli, c.model))}</span>
+          <button class="chip id-chip" data-copy-id="${esc(c.id)}" title="会话 ID（点击复制）：以后可以用它找回这段对话、接续上下文${isAdmin() && c.sessionId ? '\nClaude 会话：' + esc(c.sessionId) : ''}">ID ${esc(c.id)}<span class="copy-ico">⧉</span></button></div>` : ''}
       </div>
       ${c ? `<a class="icon-btn" href="/api/convs/${esc(c.id)}/export" download title="下载这个对话的备份（zip，解压后双击 index.html 查看）">⬇</a><button class="icon-btn" id="convMenu" title="对话设置">⋯</button>` : ''}
     </div>
@@ -428,6 +430,43 @@ function renderChat() {
   chat.ondrop = e => { e.preventDefault(); chat.classList.remove('dragging'); addFiles([...e.dataTransfer.files]); };
   renderPending();
   updateComposer();
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0'; document.body.appendChild(ta); ta.select();
+  const ok = document.execCommand('copy'); ta.remove(); return ok;
+}
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-copy-id]'); if (!b) return;
+  toast(await copyText(b.dataset.copyId) ? '已复制会话 ID：' + b.dataset.copyId : '复制失败，请手动选中复制', !navigator.clipboard);
+});
+
+// ---- 我的文件：浏览、下载 Mac 上自己的文件夹（管理员能看所有人的）
+const EXT_KIND = { png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', svg: 'image', html: 'html', htm: 'html', pdf: 'pdf',
+  mp3: 'audio', m4a: 'audio', wav: 'audio', mp4: 'video', mov: 'video', webm: 'video', txt: 'text', md: 'text', csv: 'text', json: 'text', py: 'text', js: 'text', log: 'text' };
+const extKind = name => EXT_KIND[(name.split('.').pop() || '').toLowerCase()] || 'other';
+const fsUrl = (p, dl) => '/api/fs/file?path=' + encodeURIComponent(p) + (dl ? '&dl=1' : '');
+function filesDialog() {
+  const m = modal(`<div class="pv-head"><div><b>我的文件</b><div class="faint" id="fsRoot"></div></div><button class="btn sm" data-x>关闭</button></div>
+    <div class="fs-crumb" id="fsCrumb"></div><div class="fs-list" id="fsList"></div>`, null, { wide: true, noFoot: true });
+  const titleOf = name => S.convs.find(c => c.id === name)?.title; // 对话文件夹名是对话 ID，显示成对话标题
+  const load = async rel => {
+    const box = m.querySelector('#fsList'); box.innerHTML = '<div class="faint" style="padding:14px">加载中…</div>';
+    let r; try { r = await api('GET', '/api/fs?path=' + encodeURIComponent(rel)); } catch (e) { box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; return; }
+    m.querySelector('#fsRoot').textContent = 'Mac 上的 ' + r.root + '/' + (r.path ? r.path + '/' : '');
+    const parts = r.path ? r.path.split('/') : [];
+    m.querySelector('#fsCrumb').innerHTML = [`<button data-go="">全部</button>`, ...parts.map((x, i) => `<span>/</span><button data-go="${esc(parts.slice(0, i + 1).join('/'))}">${esc(titleOf(x) || x)}</button>`)].join('');
+    box.innerHTML = r.entries.length ? r.entries.map(e => {
+      const p = (r.path ? r.path + '/' : '') + e.name, t = e.dir && titleOf(e.name);
+      return e.dir
+        ? `<div class="fs-row dir" data-go="${esc(p)}"><span class="ficon">📁</span><div class="fmain"><div class="fname">${esc(t || e.name)}</div><div class="faint">${t ? esc(e.name) + ' · ' : ''}${fmtTime(e.mtime)}</div></div><span class="faint">›</span></div>`
+        : `<div class="fs-row"><span class="ficon">${ICON[extKind(e.name)]}</span><div class="fmain"><div class="fname">${esc(e.name)}</div><div class="faint">${fmtSize(e.size)} · ${fmtTime(e.mtime)}</div></div>
+            <div class="factions">${extKind(e.name) !== 'other' ? `<a class="btn sm" href="${fsUrl(p)}" target="_blank" rel="noopener">打开</a>` : ''}<a class="btn sm" href="${fsUrl(p, 1)}" download>下载</a></div></div>`;
+    }).join('') : '<div class="empty">这里还没有文件</div>';
+    m.querySelectorAll('[data-go]').forEach(el => el.onclick = () => load(el.dataset.go));
+  };
+  load('');
 }
 
 // ---- 附件：选中即上传到中继，发送时只带 id
@@ -559,7 +598,7 @@ function renderTurn(id, streaming) {
       ${t.status === 'done' && !hasText && t.result ? `<div class="md">${md(t.result, t.linkMap)}</div>` : ''}
       ${outputsHTML(t)}
       ${t.error && t.status !== 'cancelled' ? `<div class="errbox">${esc(t.error)}</div>` : ''}
-      ${t.endedAt && isAdmin() ? `<div class="usage">${esc(usageText(t))}</div>` : ''}
+      ${t.endedAt && t.usage ? `<div class="usage">${esc(usageBrief(t))}</div>` : ''}
     </div>`;
   el.querySelector('[data-cancel]')?.addEventListener('click', e => stopTask(id, e.currentTarget));
   el.querySelector('[data-retry]')?.addEventListener('click', async () => { const r = await tryApi('POST', `/api/tasks/${id}/retry`); S.tasks.set(r.task.id, { ...r.task, events: [] }); renderTurn(r.task.id); scrollBottom(true); });

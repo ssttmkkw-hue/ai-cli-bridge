@@ -489,6 +489,16 @@ async function handle(req, res) {
       if (b.probeId) probeWaiters.get(b.probeId)?.({ quota: a.quota, error: q ? null : String(b.error || '查询失败').slice(0, 300) });
       return send(res, 200, { ok: true });
     }
+    if (p === '/api/agent/probe' && m === 'POST') {
+      const b = await readBody(req);
+      probeWaiters.get(b.probeId)?.({ result: b.result ?? null, error: b.error ? String(b.error).slice(0, 300) : null });
+      return send(res, 200, { ok: true });
+    }
+    if (p === '/api/agent/probe-file' && m === 'POST') {
+      const buf = await readRaw(req, MAX_FILE);
+      probeWaiters.get(String(req.headers['x-probe'] || ''))?.({ file: { buf, name: decodeURIComponent(String(req.headers['x-name'] || 'file')), mime: String(req.headers['x-mime'] || 'application/octet-stream') } });
+      return send(res, 200, { ok: true });
+    }
     // agent 上传 AI 产出的文件（原始字节），返回文件 id
     if (p === '/api/agent/files' && m === 'POST') {
       const t = db.tasks.find(x => x.id === req.headers['x-task']);
@@ -756,6 +766,31 @@ async function handle(req, res) {
     return sendFile(req, res, hit.meta, url.searchParams.get('dl') === '1');
   }
 
+  // ===== 文件浏览：浏览 / 下载 Mac 上「自己的文件夹」（<目录>/<用户名>/，和文件夹限制的范围一样）；管理员看整个目录 =====
+  if ((p === '/api/fs' || p === '/api/fs/file') && m === 'GET') {
+    const list = visibleAgents(user);
+    const pa = list.find(x => x.name === url.searchParams.get('agent')) || list.find(x => x.online) || list[0];
+    if (!pa) fail(404, '没有可用的设备');
+    const a = agents.get(pa.name);
+    if (!agentOnline(a)) fail(409, 'Mac 离线，暂时看不了文件');
+    const ws = pa.workspaces.find(w => w.isolate) || pa.workspaces[0];
+    if (!ws) fail(404, '没有可用的目录');
+    const rel = String(url.searchParams.get('path') || '').slice(0, 1000);
+    const base = { workspace: ws.name, user: isAdmin ? null : user.username, path: rel };
+    if (p === '/api/fs') {
+      const r = await requestProbe(a, { kind: 'ls', ...base }, 20000);
+      if (r.error) fail(400, r.error);
+      return send(res, 200, { ...r.result, root: isAdmin ? ws.name : `${ws.name}/${user.username}` });
+    }
+    const r = await requestProbe(a, { kind: 'get', ...base }, 60000);
+    if (r.error || !r.file) fail(400, r.error || '取文件失败');
+    const { buf, name, mime } = r.file;
+    const headers = { 'Content-Type': mime, 'Content-Length': buf.length, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+      'Content-Disposition': `${url.searchParams.get('dl') === '1' ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(name)}` };
+    if (/html|svg|xml|javascript/i.test(mime)) headers['Content-Security-Policy'] = "sandbox allow-scripts allow-popups allow-modals"; // 和产出文件一样放进沙盒
+    res.writeHead(200, headers); return res.end(buf);
+  }
+
   // 订阅额度：GET 拿最近一次的；POST 让 Mac 立刻查一次（相当于在 Mac 上运行 /usage）
   if (p === '/api/quota') {
     if (!isAdmin) fail(403, '只有管理员能看额度');
@@ -772,7 +807,7 @@ async function handle(req, res) {
       const maxAge = Math.max(0, Number(body.maxAge) || 0);
       if (maxAge && a.quota?.at && Date.now() - a.quota.at < maxAge) return send(res, 200, { agent: a.name, online: true, quota: a.quota, cached: true });
       // 同一时间只让 Mac 跑一次，其他请求等同一个结果
-      a.probing ||= requestProbe(a, 'usage').finally(() => { a.probing = null; });
+      a.probing ||= requestProbe(a, { kind: 'usage' }).finally(() => { a.probing = null; });
       const r = await a.probing;
       return send(res, 200, { agent: a.name, online: true, quota: r.quota, error: r.error || null });
     }
@@ -870,12 +905,13 @@ function sanitizeQuota(q) {
 }
 // 网页点「额度」：让 agent 立刻跑一次 /usage，最多等 45 秒
 const probeWaiters = new Map(); // probeId → resolve
-function requestProbe(a, kind) {
+// probe：网页要 Mac 立刻做的小事（查额度、列目录、取文件），塞进 agent 的长轮询返回值里，等 agent 回报
+function requestProbe(a, probe, timeoutMs = 45000) {
   return new Promise(resolve => {
     const id = newId('p');
-    const timer = setTimeout(() => { probeWaiters.delete(id); resolve({ quota: a.quota, error: '等待 Mac 回应超时' }); }, 45000);
+    const timer = setTimeout(() => { probeWaiters.delete(id); resolve({ quota: a.quota, error: '等待 Mac 回应超时' }); }, timeoutMs);
     probeWaiters.set(id, r => { clearTimeout(timer); probeWaiters.delete(id); resolve(r); });
-    (a.probes ||= []).push({ id, kind });
+    (a.probes ||= []).push({ id, ...probe });
     wakeAgent(a.name);
   });
 }

@@ -62,7 +62,7 @@ function plan(convs, tasksOf, blobPath) {
     return {
       title: c.title, cli: c.cli, model: c.model, createdAt: c.createdAt, updatedAt: c.updatedAt, dir,
       tasks: tasks.map(t => ({
-        prompt: t.prompt, status: t.status, createdAt: t.createdAt, startedAt: t.startedAt, endedAt: t.endedAt,
+        prompt: t.prompt, status: t.status, cli: t.cli, model: t.model, createdAt: t.createdAt, startedAt: t.startedAt, endedAt: t.endedAt,
         error: t.error, result: t.result, usage: t.usage, linkMap: t.linkMap || {},
         events: (t.events || []).filter(e => !isDevInfo(e)), // 开发用的提示不导出
         inputs: (t.inputs || []).map(f => ({ id: f.id, name: f.name, mime: f.mime, size: f.size, stored: !!files[f.id] })),

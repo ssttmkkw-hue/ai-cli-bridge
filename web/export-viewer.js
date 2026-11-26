@@ -24,7 +24,7 @@ function turnHTML(t) {
       ${t.status === 'done' && !hasText && t.result ? `<div class="md">${md(t.result, t.linkMap)}</div>` : ''}
       ${outputsHTML(t)}
       ${t.error && t.status !== 'cancelled' ? `<div class="errbox">${esc(t.error)}</div>` : ''}
-      ${t.endedAt ? `<div class="usage">${esc(usageText(t))}</div>` : ''}
+      ${t.endedAt && t.usage ? `<div class="usage">${esc(usageBrief(t))}</div>` : ''}
     </div></div>`;
 }
 

@@ -238,6 +238,20 @@ const uc = (await U('POST', '/api/convs', { agent: AGENT, cli: 'mock', workspace
 await U('POST', `/api/convs/${uc.id}/send`, { prompt: 'a' });
 ok((await U('POST', `/api/convs/${uc.id}/send`, { prompt: 'b' })).status === 429, '每日额度生效');
 ok((await fetch(B + '/api/convs', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' })).status === 415, '非 JSON 写请求被拒（防 CSRF）');
+
+// 我的文件：普通用户只能看自己的文件夹（<目录>/<用户名>/），管理员能看所有人的
+if (agent.workspaces?.find(w => w.name === WS)?.isolate) {
+  const mine = (await U('GET', '/api/fs')).j;
+  ok(mine?.root === `${WS}/${name}` && mine.entries.some(e => e.dir && e.name === uc.id), '我的文件：普通用户看到的是自己的文件夹，里面有自己对话的目录', mine?.root);
+  const bad = await Promise.all(['../admin', '..', '.ai-bridge', `${uc.id}/../../admin`, '/etc'].map(p => U('GET', '/api/fs?path=' + encodeURIComponent(p))));
+  ok(bad.every(r => r.status === 400), '我的文件：.. / 隐藏文件 / 绝对路径都出不了自己的文件夹', bad.map(r => r.status).join(','));
+  ok((await U('GET', '/api/fs/file?path=' + encodeURIComponent(`../admin/${conv.id}/notes.md`))).status === 400, '我的文件：拿不到别人文件夹里的文件');
+  const all = (await A('GET', '/api/fs')).j;
+  ok(all?.entries?.some(e => e.name === 'admin') && all.entries.some(e => e.name === name), '我的文件：管理员能看到所有人的文件夹');
+  const f = await fetch(`${B}/api/fs/file?dl=1&path=${encodeURIComponent(`admin/${conv.id}/notes.md`)}`, { headers: { cookie: await login('admin', pw) } });
+  ok(f.status === 200 && (await f.text()).includes('新增一行') && /attachment/.test(f.headers.get('content-disposition') || ''), '我的文件：下载的内容和 Mac 上的文件一致');
+  ok((await fetch(B + '/api/fs')).status === 401, '我的文件：未登录不能看');
+} else console.log('- 跳过「我的文件」测试：', WS, '没开 isolate');
 ok((await fetch(B + '/api/agent/poll?name=x', { headers: { Authorization: 'Bearer nope' } })).status === 401, '错误的 agent token 被拒');
 
 // 清理

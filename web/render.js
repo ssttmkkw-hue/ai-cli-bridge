@@ -159,10 +159,19 @@ function eventsHTML(events, linkMap, showDev = false, simple = false) {
   return html;
 }
 
+// 每条回答下面那一行：模型 · 总 token 数（输入含缓存 + 输出，不细分）
+function usageBrief(t) {
+  const u = t.usage || {};
+  const total = u.total ?? ((u.in || 0) + (u.out || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0));
+  const model = modelLabel(t.cli, u.model || t.model);
+  return [model !== '默认' ? model : (CLI_NAME[t.cli] || ''), total ? total.toLocaleString('en-US') + ' tokens' : ''].filter(Boolean).join(' · ');
+}
+// 完整用量（管理员的任务详情里用）
 function usageText(t) {
   const u = t.usage || {}; const bits = [];
   if (t.startedAt && t.endedAt) bits.push('耗时 ' + fmtDur(t.endedAt - t.startedAt));
-  if (u.in != null) bits.push(`输入 ${u.in} / 输出 ${u.out} tokens`);
+  if (u.in != null) bits.push(`输入 ${u.in}${u.cacheRead || u.cacheWrite ? ` + 缓存 ${(u.cacheRead || 0) + (u.cacheWrite || 0)}` : ''} / 输出 ${u.out} tokens`);
+  if (u.model) bits.push(u.model);
   if (u.cost) bits.push('$' + u.cost.toFixed(4));
   if (u.turns) bits.push(u.turns + ' 轮');
   return bits.join(' · ');

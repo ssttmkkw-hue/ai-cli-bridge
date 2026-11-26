@@ -370,7 +370,54 @@ function reportQuota(q, probeId, error) {
   lastQuotaReport = Date.now();
   api('POST', '/api/agent/quota', { agent: cfg.name, probeId, quota: q || null, error: error || null }).catch(e => console.error('[agent] 上报额度失败', e.message));
 }
+// ---------------------------------------------------------------- 文件浏览（网页上浏览 / 下载 Mac 上的文件）
+// 范围和文件夹限制一样：普通用户只能看 <目录>/<用户名>/，管理员（pr.user 为空）看整个目录。
+// 路径一律先解析成真实路径再检查是否还在范围内：.. 、隐藏文件（. 开头）、指到外面的快捷方式都不行。
+function probeReply(id, result, error) {
+  api('POST', '/api/agent/probe', { agent: cfg.name, probeId: id, result: result ?? null, error: error || null }).catch(e => console.error('[agent] 回报查询结果失败', e.message));
+}
+function fsResolve(pr) {
+  const ws = workspaces.find(w => w.name === pr.workspace); if (!ws) throw new Error('目录不存在');
+  if (pr.user && !ws.isolate) throw new Error('这个目录不是每人独立的，不能浏览');
+  const root = pr.user ? path.join(ws.path, safeSeg(pr.user)) : ws.path;
+  const parts = String(pr.path || '').split(/[\\/]+/).filter(Boolean);
+  if (parts.some(x => x === '..' || x.startsWith('.'))) throw new Error('路径不合法');
+  if (!fs.existsSync(root)) return { root, abs: null, parts }; // 还没用过：文件夹还没建
+  const realRoot = fs.realpathSync(root);
+  const abs = path.join(realRoot, ...parts);
+  if (!fs.existsSync(abs)) throw new Error('文件或文件夹不存在');
+  const real = fs.realpathSync(abs);
+  if (real !== realRoot && !inside(real, realRoot)) throw new Error('路径不合法');
+  return { root: realRoot, abs: real, parts };
+}
+function fsList(pr) {
+  const { abs, parts } = fsResolve(pr);
+  if (!abs) return { path: '', entries: [] };
+  if (!fs.statSync(abs).isDirectory()) throw new Error('不是文件夹');
+  const entries = [];
+  for (const e of fs.readdirSync(abs, { withFileTypes: true })) {
+    if (e.name.startsWith('.') || e.isSymbolicLink()) continue; // 隐藏文件、快捷方式不显示
+    if (!e.isDirectory() && !e.isFile()) continue;
+    try { const st = fs.statSync(path.join(abs, e.name)); entries.push({ name: e.name, dir: e.isDirectory(), size: e.isFile() ? st.size : null, mtime: st.mtimeMs }); } catch {}
+    if (entries.length >= 1000) break;
+  }
+  entries.sort((x, y) => (y.dir - x.dir) || y.mtime - x.mtime); // 文件夹在前，新的在前
+  return { path: parts.join('/'), entries };
+}
+async function fsGet(pr) {
+  const { abs } = fsResolve(pr);
+  if (!abs || !fs.statSync(abs).isFile()) throw new Error('不是文件');
+  const size = fs.statSync(abs).size;
+  if (size > MAX_UPLOAD) throw new Error(`文件太大（${(size / 1048576).toFixed(1)}MB），网页上只能下载 25MB 以内的文件`);
+  const r = await fetch(cfg.relayUrl + '/api/agent/probe-file', {
+    method: 'POST', body: fs.readFileSync(abs),
+    headers: { Authorization: 'Bearer ' + cfg.token, 'Content-Type': 'application/octet-stream', 'X-Probe': pr.id, 'X-Name': encodeURIComponent(path.basename(abs)), 'X-Mime': mimeOf(abs) },
+  });
+  if (!r.ok) throw new Error('上传失败：' + r.status);
+}
 function runProbe(pr) {
+  if (pr.kind === 'ls') { try { probeReply(pr.id, fsList(pr)); } catch (e) { probeReply(pr.id, null, e.message); } return; }
+  if (pr.kind === 'get') { fsGet(pr).catch(e => probeReply(pr.id, null, e.message)); return; }
   if (pr.kind !== 'usage') return reportQuota(null, pr.id, '不支持的查询');
   const c = clis.claude;
   if (!c?.ok) return reportQuota(null, pr.id, '这台设备没有可用的 Claude Code');
@@ -431,7 +478,7 @@ function makeParser(kind, emit) {
     return {
       st,
       line(o) {
-        if (o.type === 'system' && o.subtype === 'init') { st.sessionId = o.session_id; emit({ sessionId: o.session_id }); emit({ events: [{ k: 'info', dev: true, d: `模型 ${o.model || ''} · 目录 ${o.cwd}` }] }); }
+        if (o.type === 'system' && o.subtype === 'init') { st.sessionId = o.session_id; st.model = o.model || null; emit({ sessionId: o.session_id }); emit({ events: [{ k: 'info', dev: true, d: `模型 ${o.model || ''} · 目录 ${o.cwd}` }] }); }
         else if (o.type === 'stream_event') {
           const ev = o.event;
           if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta') { st.textFromDelta = true; emit({ events: [{ k: 'text', d: ev.delta.text }] }); }
@@ -459,7 +506,9 @@ function makeParser(kind, emit) {
           st.isError = !!o.is_error;
           if (o.is_error) st.errorMsg = o.result || o.subtype;
           if (o.permission_denials?.length) emit({ events: [{ k: 'info', d: `有 ${o.permission_denials.length} 个操作因权限级别被拒绝（${[...new Set(o.permission_denials.map(x => x.tool_name))].join(', ')}）` }] });
-          emit({ usage: { cost: o.total_cost_usd, turns: o.num_turns, ms: o.duration_ms, in: o.usage?.input_tokens, out: o.usage?.output_tokens } });
+          { const u = o.usage || {}; const cacheRead = u.cache_read_input_tokens || 0, cacheWrite = u.cache_creation_input_tokens || 0;
+            emit({ usage: { cost: o.total_cost_usd, turns: o.num_turns, ms: o.duration_ms, in: u.input_tokens, out: u.output_tokens, cacheRead, cacheWrite,
+              total: (u.input_tokens || 0) + cacheRead + cacheWrite + (u.output_tokens || 0), model: st.model } }); }
         }
       },
     };
@@ -480,7 +529,7 @@ function makeParser(kind, emit) {
           else if (it.type === 'web_search') emit({ events: [{ k: 'tool', name: 'web_search', d: it.query || '' }] });
           else if (it.type === 'error') emit({ events: [{ k: 'err', d: it.message }] });
         } else if (o.type === 'turn.completed') {
-          emit({ usage: { in: o.usage?.input_tokens, out: o.usage?.output_tokens, cached: o.usage?.cached_input_tokens } });
+          emit({ usage: { in: o.usage?.input_tokens, out: o.usage?.output_tokens, cached: o.usage?.cached_input_tokens, total: (o.usage?.input_tokens || 0) + (o.usage?.output_tokens || 0) } }); // Codex 的 input_tokens 已经包含缓存部分
         } else if (o.type === 'turn.failed') { st.isError = true; st.errorMsg = o.error?.message || '执行失败'; }
         else if (o.type === 'error') { st.isError = true; st.errorMsg = o.message; }
       },

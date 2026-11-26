@@ -88,7 +88,19 @@ html, body { overflow: hidden; }
 .side-head { padding: 12px; }
 .side-head .btn { width: 100%; justify-content: center; }
 .side-foot { padding: 10px 12px; border-top: 1px solid var(--line); flex: none; }
-.side-foot .btn { width: 100%; justify-content: center; text-decoration: none; color: var(--sub); font-size: 13.5px; }
+.side-foot { display: flex; gap: 8px; }
+.side-foot .btn { flex: 1; justify-content: center; text-decoration: none; color: var(--sub); font-size: 13.5px; padding-left: 8px; padding-right: 8px; }
+/* 我的文件 */
+.fs-crumb { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 4px 0 10px; font-size: 13.5px; }
+.fs-crumb button { border: 0; background: none; color: var(--accent); padding: 2px 4px; border-radius: 6px; cursor: pointer; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fs-crumb button:hover { background: var(--accent-soft); }
+.fs-crumb span { color: var(--faint); }
+.fs-list { border: 1px solid var(--line); border-radius: 10px; max-height: 60vh; overflow: auto; }
+.fs-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+.fs-row:last-child { border-bottom: 0; }
+.fs-row.dir { cursor: pointer; } .fs-row.dir:hover { background: var(--panel2); }
+.fs-row .fmain { flex: 1; min-width: 0; } .fs-row .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fs-row .factions { display: flex; gap: 6px; } .fs-row .factions a { text-decoration: none; color: inherit; }
 a.icon-btn { text-decoration: none; color: inherit; display: inline-grid; place-items: center; }
 .convs { flex: 1; overflow: auto; padding: 0 8px 12px; }
 .conv { padding: 9px 11px; border-radius: 9px; cursor: pointer; margin-bottom: 2px; }
@@ -101,6 +113,10 @@ a.icon-btn { text-decoration: none; color: inherit; display: inline-grid; place-
 .chat-head .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-head .meta { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; min-width: 0; }
 .msgs { flex: 1; overflow: auto; padding: 22px 18px 8px; }
+/* 对话顶部的会话 ID（点击复制） */
+.id-chip { border: 0; cursor: pointer; font-family: var(--mono); font-size: 11.5px; }
+.id-chip:hover { background: var(--accent-soft); color: var(--accent); }
+.id-chip .copy-ico { font-family: inherit; opacity: .7; }
 /* 额度面板：右上角 📊 下拉，或对话里发 /usage */
 .quota-pop { position: fixed; top: 60px; right: 12px; z-index: 45; width: min(360px, calc(100vw - 24px)); padding: 14px 16px; box-shadow: var(--shadow); }
 .quota-card { padding: 14px 16px; max-width: 420px; }
