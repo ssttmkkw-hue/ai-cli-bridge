@@ -64,6 +64,7 @@ async function afterLogin() {
   connectStream();
   await Promise.all([loadAgents(), loadConvs()]);
   S.loaded = true; // 加载完之前不显示「未连接」「还没有对话」这类状态，免得一闪而过
+  setTimeout(() => refreshQuota(true), 500); // 右上角的额度圆环：登录后先查一次（数据够新就直接用）
   // 手机上一打开先看历史对话
   if (!S.conv && matchMedia('(max-width:760px)').matches) S.sideOpen = true;
   render();
@@ -76,7 +77,7 @@ function connectStream() {
     if (S.view === 'agents') renderView();
     if (S.view === 'chat' && !S.conv) renderNewChat(); // 新对话顶部的 Mac 在线状态
     if (S.view === 'chat') updateComposer();
-    if (S.quotaOpen || $('#quotaInline')) renderQuota(); // 任务里顺带更新的额度
+    if (S.quotaOpen || $('#quotaInline')) renderQuota(); else updateQuotaRing(); // 任务里顺带更新的额度
   });
   es.addEventListener('task', e => onTaskUpdate(JSON.parse(e.data)));
   es.addEventListener('chunk', e => onChunk(JSON.parse(e.data)));
@@ -119,7 +120,7 @@ function render() {
       <div class="brand"><i>&gt;_</i><span>AI 遥控台</span></div>
       <nav class="nav">${tabs.map(([k, n]) => `<button data-v="${k}" class="${S.view === k ? 'on' : ''}">${n}</button>`).join('')}</nav>
       <div class="me"><span class="dot" id="headDot"></span><span class="name">${esc(S.me.username)}</span>
-        <button class="icon-btn" id="quotaBtn" title="额度使用情况（也可以在对话里发 /usage）">📊</button><button class="icon-btn" id="prefBtn" title="偏好设置">⚙</button><button class="icon-btn" id="pwBtn" title="改密码">🔑</button><button class="icon-btn" id="logout" title="退出">⏻</button></div>
+        <button class="icon-btn qbtn" id="quotaBtn" title="额度使用情况（也可以在对话里发 /usage）">${quotaRingSVG()}</button><button class="icon-btn" id="prefBtn" title="偏好设置">⚙</button><button class="icon-btn" id="pwBtn" title="改密码">🔑</button><button class="icon-btn" id="logout" title="退出">⏻</button></div>
     </header>
     <div class="quota-pop card" id="quotaPop" ${S.quotaOpen ? '' : 'hidden'}></div>
     <div class="main" id="main"></div>`;
@@ -134,6 +135,22 @@ function render() {
 }
 // ============================================================ 额度（5 小时 / 本周 / 恢复时间），和 Claude Code 的 /usage 一样
 S.quota = { loading: false, error: null };
+// 用量等级（颜色）：蓝 < 40% ≤ 绿 < 70% ≤ 橙 < 90% ≤ 红
+const quotaLevel = p => p >= 90 ? 'red' : p >= 70 ? 'orange' : p >= 40 ? 'green' : 'blue';
+const quotaMax = q => (q?.windows || []).reduce((m, w) => Math.max(m, w.percent), -1); // 用得最多的那个窗口
+// 圆环图标：灰色底圈 + 一段彩色弧线（从 12 点方向顺时针），长度 = 用得最多的那个额度
+function quotaRingSVG() {
+  const q = pickAgent()?.quota, p = quotaMax(q);
+  const C = 2 * Math.PI * 14, len = p > 0 ? Math.max(C * p / 100, 3) : 0;
+  return `<svg class="qring ${p < 0 ? 'none' : 'lv-' + quotaLevel(p)}" viewBox="0 0 36 36" aria-hidden="true">
+    <circle class="trk" cx="18" cy="18" r="14"/>${len ? `<circle class="arc" cx="18" cy="18" r="14" stroke-dasharray="${len.toFixed(2)} ${C.toFixed(2)}" transform="rotate(-90 18 18)"/>` : ''}</svg>`;
+}
+function updateQuotaRing() {
+  const b = $('#quotaBtn'); if (!b) return;
+  b.innerHTML = quotaRingSVG();
+  const q = pickAgent()?.quota;
+  b.title = q?.windows?.length ? q.windows.map(w => `${w.label} ${w.percent}%`).join(' · ') + '（点开看详情，也可以在对话里发 /usage）' : '额度使用情况（也可以在对话里发 /usage）';
+}
 const fmtLeft = ms => {
   const min = Math.max(1, Math.round(ms / 60000)), h = Math.floor(min / 60), d = Math.floor(h / 24);
   return d ? `${d} 天 ${h % 24} 小时` : h ? `${h} 小时 ${min % 60} 分` : `${min} 分钟`;
@@ -148,8 +165,8 @@ function resetText(w) {
 function quotaHTML() {
   const a = pickAgent(), q = a?.quota, st = S.quota;
   const rows = (q?.windows || []).map(w => `<div class="qrow">
-      <div class="qhead"><b>${esc(w.label)}</b><span class="qpct ${w.percent >= 90 ? 'bad' : w.percent >= 70 ? 'warn' : ''}">${w.percent}% 已用</span></div>
-      <div class="qbar"><i class="${w.percent >= 90 ? 'bad' : w.percent >= 70 ? 'warn' : ''}" style="width:${w.percent}%"></i></div>
+      <div class="qhead"><b>${esc(w.label)}</b><span class="qpct lv-${quotaLevel(w.percent)}">${w.percent}% 已用</span></div>
+      <div class="qbar"><i class="lv-${quotaLevel(w.percent)}" style="width:${w.percent}%"></i></div>
       <div class="faint">${esc(resetText(w))}</div></div>`).join('');
   return `<div class="qtop"><b>额度使用情况</b>
       <button class="btn sm" data-quota-refresh ${st.loading ? 'disabled' : ''}>${st.loading ? '<span class="spin"></span> 查询中' : '刷新'}</button></div>
@@ -161,14 +178,16 @@ function renderQuota() {
   const html = quotaHTML();
   const pop = $('#quotaPop'); if (pop) pop.innerHTML = html;
   const inline = $('#quotaInline'); if (inline) inline.innerHTML = html; // 对话里发 /usage 时显示的那张卡片
-  document.querySelectorAll('[data-quota-refresh]').forEach(b => b.onclick = refreshQuota);
+  document.querySelectorAll('[data-quota-refresh]').forEach(b => b.onclick = () => refreshQuota());
+  updateQuotaRing();
 }
-async function refreshQuota() {
+async function refreshQuota(auto = false) {
   if (S.quota.loading) return;
-  const a = pickAgent(); if (!a) { S.quota.error = 'Mac 还没连上'; return renderQuota(); }
+  const a = pickAgent(); if (!a) { if (!auto) { S.quota.error = 'Mac 还没连上'; renderQuota(); } return; }
+  if (auto && !a.online) return;
   S.quota = { loading: true, error: null }; renderQuota();
   try {
-    const r = await api('POST', '/api/quota', { agent: a.name });
+    const r = await api('POST', '/api/quota', { agent: a.name, maxAge: auto ? 4 * 60000 : 0 });
     if (r.quota) a.quota = r.quota;
     S.quota = { loading: false, error: r.error || null };
   } catch (e) { S.quota = { loading: false, error: e.message }; }
@@ -179,6 +198,12 @@ function setQuotaOpen(open) {
   pop.hidden = !open;
   if (open) { renderQuota(); const q = pickAgent()?.quota; if (!q || Date.now() - (q.at || 0) > 60000) refreshQuota(); } // 超过 1 分钟的数据自动刷新
 }
+const QUOTA_EVERY = 5 * 60000;
+setInterval(() => { if (S.me && S.loaded && document.visibilityState === 'visible') refreshQuota(true); }, QUOTA_EVERY);
+document.addEventListener('visibilitychange', () => {
+  const q = pickAgent()?.quota;
+  if (S.me && S.loaded && document.visibilityState === 'visible' && Date.now() - (q?.at || 0) > QUOTA_EVERY) refreshQuota(true);
+});
 document.addEventListener('mousedown', e => { if (S.quotaOpen && !e.target.closest('#quotaPop, #quotaBtn')) setQuotaOpen(false); });
 // 对话里发 /usage：不发给 AI，直接在对话末尾显示额度卡片（不保存）
 function showUsageInChat() {

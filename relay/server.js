@@ -698,7 +698,8 @@ async function handle(req, res) {
 
   // 订阅额度：GET 拿最近一次的；POST 让 Mac 立刻查一次（相当于在 Mac 上运行 /usage）
   if (p === '/api/quota') {
-    const name = url.searchParams.get('agent') || (m === 'POST' ? (await readBody(req)).agent : null);
+    const body = m === 'POST' ? await readBody(req) : {};
+    const name = url.searchParams.get('agent') || body.agent || null;
     const list = visibleAgents(user);
     const pa = list.find(x => x.name === name) || list.find(x => x.online) || list[0];
     if (!pa) fail(404, '没有可用的设备');
@@ -706,7 +707,12 @@ async function handle(req, res) {
     if (m === 'GET') return send(res, 200, { agent: a.name, online: agentOnline(a), quota: a.quota });
     if (m === 'POST') {
       if (!agentOnline(a)) return send(res, 200, { agent: a.name, online: false, quota: a.quota, error: 'Mac 离线，显示的是上次的数据' });
-      const r = await requestProbe(a, 'usage');
+      // 网页每 5 分钟自动查一次：带 maxAge，数据够新就直接返回，不让 Mac 重复跑（开着好几个网页时尤其重要）
+      const maxAge = Math.max(0, Number(body.maxAge) || 0);
+      if (maxAge && a.quota?.at && Date.now() - a.quota.at < maxAge) return send(res, 200, { agent: a.name, online: true, quota: a.quota, cached: true });
+      // 同一时间只让 Mac 跑一次，其他请求等同一个结果
+      a.probing ||= requestProbe(a, 'usage').finally(() => { a.probing = null; });
+      const r = await a.probing;
       return send(res, 200, { agent: a.name, online: true, quota: r.quota, error: r.error || null });
     }
   }

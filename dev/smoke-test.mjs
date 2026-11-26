@@ -204,6 +204,12 @@ if (agent.clis?.claude?.ok) {
   ok(!q?.error && w.five_hour && w.seven_day && [w.five_hour, w.seven_day].every(x => x.percent >= 0 && x.percent <= 100 && x.resetsAt > Date.now() - 3600000),
     '额度：从 /usage 读出 5 小时和本周额度、恢复时间', q?.error || `5 小时 ${w.five_hour?.percent}%，本周 ${w.seven_day?.percent}%，${((Date.now() - t0) / 1000).toFixed(1)}s`);
   ok((await A('GET', '/api/quota?agent=' + AGENT)).j?.quota?.at > t0 - 1000, '额度：查询结果会缓存，GET 能直接拿到');
+  // 网页每 5 分钟自动查：带 maxAge 时数据够新就直接返回，不让 Mac 再跑
+  const t1 = Date.now(), c1 = (await A('POST', '/api/quota', { agent: AGENT, maxAge: 240000 })).j;
+  ok(c1?.cached === true && Date.now() - t1 < 500, '额度：自动查询复用 4 分钟内的结果', `${Date.now() - t1}ms`);
+  // 好几个网页同时点刷新：Mac 只跑一次，大家拿同一个结果
+  const [p1, p2] = await Promise.all([A('POST', '/api/quota', { agent: AGENT }), A('POST', '/api/quota', { agent: AGENT })]);
+  ok(p1.j?.quota?.at && p1.j.quota.at === p2.j?.quota?.at, '额度：同时发起的查询合并成一次');
 } else console.log('- 跳过额度测试：这台设备没有 Claude Code');
 
 // 4. 权限隔离

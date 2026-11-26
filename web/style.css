@@ -90,10 +90,18 @@ a.icon-btn { text-decoration: none; color: inherit; display: inline-grid; place-
 .qtop { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .qrow { margin: 10px 0 12px; }
 .qhead { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; }
-.qpct { font-size: 13px; color: var(--sub); } .qpct.warn { color: var(--warn); } .qpct.bad { color: var(--bad); }
+/* 用量等级颜色：蓝 → 绿 → 橙 → 红 */
+.lv-blue { --q: var(--accent); } .lv-green { --q: var(--ok); } .lv-orange { --q: var(--warn); } .lv-red { --q: var(--bad); }
+.qpct { font-size: 13px; color: var(--q, var(--sub)); font-weight: 600; }
 .qbar { height: 8px; border-radius: 99px; background: var(--panel2); overflow: hidden; margin: 6px 0 4px; }
-.qbar i { display: block; height: 100%; background: var(--accent); border-radius: 99px; transition: width .3s; }
-.qbar i.warn { background: var(--warn); } .qbar i.bad { background: var(--bad); }
+.qbar i { display: block; height: 100%; background: var(--q, var(--accent)); border-radius: 99px; transition: width .3s; }
+/* 右上角的额度圆环（像 Claude 的用量圈）：灰色底圈 + 彩色弧线，圆头 */
+.qbtn { display: inline-grid; place-items: center; }
+.qring { width: 20px; height: 20px; display: block; }
+.qring circle { fill: none; stroke-width: 5; }
+.qring .trk { stroke: var(--line); }
+.qring .arc { stroke: var(--q, var(--accent)); stroke-linecap: round; transition: stroke-dasharray .4s, stroke .4s; }
+.qring.none .trk { stroke-dasharray: 3 3; } /* 还没有数据：虚线底圈 */
 .qrow .faint, .qfoot { font-size: 12.5px; }
 /* 新对话顶部：设备 + CLI + 模型，直接点选 */
 .newchat { border-bottom: 1px solid var(--line); background: var(--panel); padding: 12px 18px; flex: none; }
