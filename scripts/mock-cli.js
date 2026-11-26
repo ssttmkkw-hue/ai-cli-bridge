@@ -28,12 +28,16 @@ process.stdin.on('end', async () => {
     out({ type: 'item.completed', item: { type: 'file_change', changes: [{ kind: 'add', path: 'chart.svg' }, { kind: 'add', path: 'report.html' }, { kind: 'update', path: 'notes.md' }] } });
     extra = '\n\n生成的图表：\n\n![柱状图](./chart.svg)\n\n完整报告见 [report.html](report.html)';
   }
-  // 读写探针：「读取:路径」「写入:路径」真的去读写，用来测文件夹限制
+  // 探针：「读取:路径」「写入:路径」真的去读写，「执行:程序路径」真的去启动（不带参数时用 --version 一类无害参数），用来测文件夹限制
   const probes = [];
-  for (const [, op, p] of input.matchAll(/(读取|写入)[:：](\S+)/g)) {
+  for (const [, op, p] of input.matchAll(/(读取|写入|执行)[:：](\S+)/g)) {
     const fs = require('fs');
-    try { if (op === '读取') fs.readFileSync(p); else fs.writeFileSync(p, 'probe\n'); probes.push(`${op} ${p}：成功`); }
-    catch (e) { probes.push(`${op} ${p}：失败 ${e.code || e.message}`); }
+    try {
+      if (op === '读取') fs.readFileSync(p);
+      else if (op === '写入') fs.writeFileSync(p, 'probe\n');
+      else { const r = require('child_process').spawnSync(p, ['-h'], { timeout: 5000 }); if (r.error) throw r.error; }
+      probes.push(`${op} ${p}：成功`);
+    } catch (e) { probes.push(`${op} ${p}：失败 ${e.code || e.message}`); }
   }
   if (probes.length) extra += '\n\n' + probes.join('\n');
   const att = input.match(/\[用户附件\][\s\S]*/);

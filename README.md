@@ -29,7 +29,7 @@ agent 是**主动连出去**领任务的，所以 Mac 放在家里路由器后�
 | `mac/install-mac.sh` | 在 Mac 上装成开机自启服务（launchd） |
 | `scripts/start-local.js` | 本地联调：一条命令同时起中继 + agent |
 | `scripts/mock-cli.js` | 假 CLI，不花额度测试整条链路 |
-| `dev/smoke-test.mjs` | 冒烟测试（30 项，只用假 CLI） |
+| `dev/smoke-test.mjs` | 冒烟测试（31 项，只用假 CLI） |
 | `docs/DEVELOPMENT.md` | 开发交接：代码地图、已知问题、下一步计划、Mac 验证清单 |
 | `data/` | 运行后生成：`config.json`（agent token）、`users.json`、`db.json`、`sessions.json`（登录会话）、`files/`（产出与附件）、`INITIAL_ADMIN.txt` |
 
@@ -41,7 +41,7 @@ npm run local        # 等同于 node scripts/start-local.js 5227
 
 打开 http://localhost:5227 ，管理员账号 `admin`，初始密码在 `data/INITIAL_ADMIN.txt`。
 本地联调会自动生成 `agent/agent.local.json`，带一个「模拟 CLI」和两个测试目录（`test-workspaces/sandbox` 可写、`test-workspaces/readonly` 只读）。
-另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 30 项功能，不花额度。
+另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 31 项功能，不花额度。
 
 ## 二、部署到 Mac Air
 
@@ -118,11 +118,16 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 - 只有配置里列出的 `workspaces` 能被使用，网页只传目录**名字**，不能传任意路径
 - 每个目录的 `maxLevel` 是硬上限，即使管理员也越不过去
 
-**文件夹限制**（macOS，默认开启）：Claude Code 自己的权限设置拦不住读取（Read 工具能读本机任何文件），所以「只读问答 / 可改文件」级别的 CLI 用系统自带的 `sandbox-exec` 启动，由内核拒绝越界读写：
+网页上新建对话时不再选目录和权限：自动用设备上开了 `isolate` 的目录，权限给到这个用户能用的最高一级；实际能碰到什么，由下面的文件夹限制兜住。
+
+**文件夹限制**（macOS，默认开启）：Claude Code 自己的权限设置拦不住读取（Read 工具能读本机任何文件），所以**所有级别**（包括「完全放开」）的 CLI 都用系统自带的 `sandbox-exec` 启动，由内核拒绝越界读写：
 - 只能读写**这个用户自己的文件夹**：开了 `isolate` 的目录是 `<目录>/<用户名>/`（他所有对话都在里面），否则是目录本身
 - 读不到：其他用户的文件夹、其他工作目录、本项目目录（含 `data/` 里的密码哈希和 agent token）、家目录下的其他文件、其他对话在 `~/.claude/projects/` 里的会话记录
+- 防止借别的程序绕出沙盒：禁止执行 `open`、`osascript`、`launchctl`、`crontab`、`at`、`shortcuts`、`automator`、`defaults`，禁止发送 AppleEvents、写偏好设置、连接 LaunchServices
+- 可以联网（下载、调用网页接口都正常）
 - 为了让 Claude Code 能跑，仍然放开：它自己的程序、`~/.claude.json`（含登录账号邮箱和项目列表）、`~/.claude/settings.json`、缓存目录、`~/Library/Keychains`（登录凭证，加密存储）
-- 不受限制：「完全放开」级别；Codex（自带沙盒，不能再套一层）——多人使用时不要把这两样分给别人
+- ⚠️ 残留风险：Claude Code 用系统的 `security` 命令读登录凭证，所以这个命令不能禁。「完全放开」级别下 Claude 能执行任意命令，因此能读到它自己的登录凭证，以及钥匙串里允许 `security` 直接读取的条目。给不完全信任的人开账号时，在「用户权限」里把他的最高权限设成「可改文件」（网页会自动按这个上限创建对话）
+- Codex 不能再套一层沙盒：开启限制时，Codex 的「完全放开」会降成它自带的 workspace-write 沙盒（只能改对话文件夹，但读取不受限制）
 - 受限时用不了你装在 `~/.claude/` 下的技能和插件
 
 **三档权限对应的 CLI 参数**：

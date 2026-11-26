@@ -353,7 +353,7 @@ function makeParser(kind, emit) {
     return {
       st,
       line(o) {
-        if (o.type === 'system' && o.subtype === 'init') { st.sessionId = o.session_id; emit({ sessionId: o.session_id }); emit({ events: [{ k: 'info', d: `模型 ${o.model || ''} · 目录 ${o.cwd}` }] }); }
+        if (o.type === 'system' && o.subtype === 'init') { st.sessionId = o.session_id; emit({ sessionId: o.session_id }); emit({ events: [{ k: 'info', dev: true, d: `模型 ${o.model || ''} · 目录 ${o.cwd}` }] }); }
         else if (o.type === 'stream_event') {
           const ev = o.event;
           if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta') { st.textFromDelta = true; emit({ events: [{ k: 'text', d: ev.delta.text }] }); }
@@ -478,13 +478,17 @@ async function collectOutputs(t, ws, before, answerText) {
 }
 
 // ---------------------------------------------------------------- 文件夹限制（macOS 沙盒）
-// 「只读问答 / 可改文件」级别的 CLI 用 sandbox-exec 启动，由系统内核拒绝它读写允许范围以外的文件
-// （Claude Code 自己的权限设置拦不住读取：Read 工具能读本机任何文件）。「完全放开」不限制。
+// 所有级别（包括「完全放开」）的 CLI 都用 sandbox-exec 启动，由系统内核拒绝它读写允许范围以外的文件
+// （Claude Code 自己的权限设置拦不住读取：Read 工具能读本机任何文件）。
 // 允许范围：isolate 目录是 <目录>/<用户名>/（这个用户的所有对话），否则是目录本身。
 const CONFINE = process.platform === 'darwin' && cfg.confine !== false && fs.existsSync('/usr/bin/sandbox-exec');
-const CONFINE_CLIS = new Set(['claude', 'mock']); // Codex 自带沙盒，嵌套沙盒会失败，暂不支持
-console.log(CONFINE ? '[agent] 文件夹限制：开（只读问答 / 可改文件 只能访问自己的文件夹）' : '[agent] 文件夹限制：关（只读问答也能读本机其他文件）');
-if (CONFINE && clis.codex?.ok) console.log('[agent] ⚠ Codex 暂不受文件夹限制，多人使用时不要把 Codex 分给别人');
+const CONFINE_CLIS = new Set(['claude', 'mock']); // Codex 自带沙盒，嵌套沙盒会失败：开启限制时改用它自带的沙盒（见 startTask）
+console.log(CONFINE ? '[agent] 文件夹限制：开（所有任务只能访问自己的文件夹）' : '[agent] 文件夹限制：关（任务能访问本机其他文件）');
+// 沙盒里的进程能借这些途径让「沙盒外」的程序替它干活，一律禁止：
+// open（LaunchServices 启动 App）、osascript/AppleEvents（遥控其他 App）、launchctl/crontab/at（提交后台任务）、
+// shortcuts/automator（快捷指令、自动操作）、defaults/写偏好设置（例如改终端的启动命令）
+const SANDBOX_DENY_EXEC = ['/usr/bin/open', '/usr/bin/osascript', '/usr/bin/osacompile', '/bin/launchctl', '/usr/bin/crontab',
+  '/usr/bin/at', '/usr/bin/batch', '/usr/bin/shortcuts', '/usr/bin/automator', '/usr/bin/defaults'];
 const HOME = os.homedir();
 const sbq = s => JSON.stringify(String(s)); // SBPL 字符串字面量
 const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -517,6 +521,10 @@ function sandboxProfile(root, wd, kind) {
   (regex ${sbq('^' + reEsc(path.join(HOME, '.claude.json')))}))
 (allow file-read* ${sub([path.join(HOME, 'Library', 'Keychains')])} ${lit([path.join(HOME, '.claude', 'settings.json')])}
   ${readPaths.map(p => fs.existsSync(p) && fs.statSync(p).isDirectory() ? `(subpath ${sbq(p)})` : `(literal ${sbq(p)})`).join(' ')})
+(deny process-exec ${lit(SANDBOX_DENY_EXEC)})
+(deny appleevent-send)
+(deny user-preference-write)
+(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd") (global-name-prefix "com.apple.lsd."))
 `;
 }
 
@@ -562,11 +570,17 @@ async function startTask(t) {
       if (ws.isolate && t.resumeSessionId) { t.resumeSessionId = null; emit({ events: [{ k: 'info', d: '这个目录改成了每个对话独立文件夹，之前的上下文接不上，这条消息开始新会话' }] }); }
     }
     prompt = await prepareInputs(t, ews, emit);
+    // Codex 不能套我们的沙盒：开启限制时把「完全放开」降成它自带的 workspace-write 沙盒（只能改对话文件夹）
+    if (CONFINE && t.cli === 'codex' && t.level === 'full') {
+      t.level = 'edit';
+      emit({ events: [{ k: 'info', d: 'Codex 改用它自带的沙盒：只能修改这个对话文件夹里的文件' }] });
+    }
     cmd = buildCommand(t);
-    if (CONFINE && t.level !== 'full' && CONFINE_CLIS.has(t.cli)) {
+    if (CONFINE && CONFINE_CLIS.has(t.cli)) {
       const root = ws.isolate ? path.dirname(ews.path) : ws.path;
       cmd = { bin: '/usr/bin/sandbox-exec', args: ['-p', sandboxProfile(root, ews.path, t.cli), cmd.bin, ...cmd.args] };
-      emit({ events: [{ k: 'info', d: `文件访问限制在：${ws.name}${root === ws.path ? '' : '/' + path.relative(ws.path, root)}/` }] });
+      // dev: true 的提示只在「任务」详情里显示，聊天里不显示
+      emit({ events: [{ k: 'info', dev: true, d: `文件访问限制在：${ws.name}${root === ws.path ? '' : '/' + path.relative(ws.path, root)}/` }] });
     }
     before = snapshot(ews.path);
   } catch (e) { return finish({ status: 'failed', error: e.message }); }

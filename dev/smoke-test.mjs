@@ -157,7 +157,7 @@ ok((await fetch(B + '/api/files/' + html.id)).status === 401, '未登录拿不�
   } else console.log('- 跳过共用目录排队测试：没有名为', SHARED, '的共用目录（可用 WORKSPACE2 指定）');
 }
 
-// 3c. 文件夹限制（macOS）：只读 / 可改文件级别只能访问自己的文件夹，完全放开不限制
+// 3c. 文件夹限制（macOS）：所有级别都只能访问自己的文件夹
 if (agent.confine && agent.workspaces?.find(w => w.name === WS)?.isolate) {
   const outside = path.join(ROOT, 'README.md'); // 项目目录，不在任何用户的文件夹里
   const probe = async (level, prompt) => {
@@ -170,8 +170,10 @@ if (agent.confine && agent.workspaces?.find(w => w.name === WS)?.isolate) {
   ok(/文件访问限制在/.test(e.info), '可改文件级别启用了文件夹限制', e.info.match(/文件访问限制在：\S+/)?.[0]);
   ok(e.text.includes(`读取 ${outside}：失败 EPERM`) && /写入 \.\.\/\.\.\/escape-\d+\.txt：失败 EPERM/.test(e.text), '读写自己文件夹以外的文件被系统拒绝');
   ok(e.text.includes('写入 ../mine.txt：成功') && e.text.includes('写入 ./own.txt：成功') && e.text.includes('读取 ./own.txt：成功'), '自己的文件夹（含同用户的其他对话）可以正常读写');
-  const f = await probe('full', `读取:${outside}`);
-  ok(f.text.includes(`读取 ${outside}：成功`) && !/文件访问限制在/.test(f.info), '完全放开级别不受文件夹限制');
+  const esc = ['/usr/bin/open', '/usr/bin/osascript', '/bin/launchctl'];
+  const f = await probe('full', `读取:${outside} 写入:./full.txt ${esc.map(p => '执行:' + p).join(' ')} 执行:/bin/ls`);
+  ok(f.text.includes(`读取 ${outside}：失败 EPERM`) && f.text.includes('写入 ./full.txt：成功') && /文件访问限制在/.test(f.info), '完全放开级别也只能访问自己的文件夹');
+  ok(esc.every(p => f.text.includes(`执行 ${p}：失败`)) && f.text.includes('执行 /bin/ls：成功'), '沙盒里不能用 open / osascript / launchctl 绕出去，普通命令照常');
 } else console.log('- 跳过文件夹限制测试：', agent.confine ? `${WS} 没开 isolate` : '这台设备没开文件夹限制（只支持 macOS）');
 
 // 4. 权限隔离

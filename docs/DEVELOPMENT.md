@@ -8,7 +8,7 @@
 - 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
 - Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
 - Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
-- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 30 项，全部通过。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 31 项，全部通过。
 
 ## 架构
 
@@ -44,12 +44,14 @@
 | 解析输出 | `makeParser()` 把两家的 JSON 行统一成事件 `text / tool / tool_out / think / info / err`，并记下会话 ID |
 | 文件 | `snapshot()` 任务前后各拍一次（跳过 `.git`、`node_modules` 等，上限 2 万个文件，200KB 以下的文本连内容一起记）→ `diffSnapshots()` → `lineDiff()`（LCS）→ 上传；回答里 Markdown 引用的本地文件通过 `localLinks()` + `resolveLocal()` 找到，只允许工作目录内和 `extraOutputDirs` |
 | 任务目录 | `taskDir()`：普通目录就是它本身；`isolate: true` 的目录是 `<目录>/<用户名>/<对话id>`（中继派发时带上 `convId`、`username`）。任务里的附件、快照、产出、`cwd` 都用这个目录（`ews`）。目录刚创建且带着旧会话 ID 时丢掉续接（Claude 会话按目录保存） |
-| 文件夹限制 | `CONFINE`（macOS + `cfg.confine !== false`）时，`read`/`edit` 级别的 claude 和 mock 用 `/usr/bin/sandbox-exec -p <sandboxProfile()>` 启动。规则顺序：允许一切 → 拒绝家目录、所有工作目录、项目目录 → 放开用户文件夹、本对话的 `~/.claude/projects/<编码后的cwd>`、`~/.claude.json*`、缓存 → 只读放开钥匙串、`settings.json`、CLI 自身（`confineReadPaths()`）。所有放开路径的上级目录允许 `file-read-metadata`（程序会逐级 lstat，被拒会当成异常）；mock 额外放开各级 `package.json`（Node 判断模块类型） |
+| 文件夹限制 | `CONFINE`（macOS + `cfg.confine !== false`）时，所有级别的 claude 和 mock 都用 `/usr/bin/sandbox-exec -p <sandboxProfile()>` 启动。规则顺序：允许一切 → 拒绝家目录、所有工作目录、项目目录 → 放开用户文件夹、本对话的 `~/.claude/projects/<编码后的cwd>`、`~/.claude.json*`、缓存 → 只读放开钥匙串、`settings.json`、CLI 自身（`confineReadPaths()`）→ 拒绝执行 `SANDBOX_DENY_EXEC` 里的程序、`appleevent-send`、`user-preference-write`、LaunchServices 的 mach 服务（这些都能让沙盒外的进程替它干活）。所有放开路径的上级目录允许 `file-read-metadata`（程序会逐级 lstat，被拒会当成异常）；mock 额外放开各级 `package.json`（Node 判断模块类型）。Codex 不能套：`full` 降成 `edit`（它自带的 workspace-write） |
+| 提示分级 | 开发用的提示（模型和目录、文件夹限制范围）带 `dev: true`，聊天里不显示，「任务」详情里显示（`eventsHTML(..., showDev)`） |
 | 附件 | `prepareInputs()` 下载到 `<任务目录>/.ai-bridge/uploads/<任务id>/`，把相对路径追加到 prompt |
 | 停止 | `job.cancel()` 是幂等的；`killTree()`：Windows 用 `taskkill /T /F`，Mac 结束整个进程组；进程退出但 `close` 迟迟不来时有兜底 |
 
 ### web/app.js（前端）
 - 状态都在全局 `S` 里；`render()` 画外框，`renderView()` 画当前页。
+- 新对话不弹窗：没选中对话时，聊天区顶部是 `renderNewChat()`（设备状态 + CLI / 模型单选按钮，`S.draft` 记当前选择），发第一条消息（或先加附件）时 `ensureConv()` 才创建对话；目录取设备上第一个 `isolate` 目录，权限取 `allowedLevels()` 的最高一级。Claude 的 3 个模型写死在 `CLAUDE_MODELS`，Codex 的取 agent 配置 `clis.codex.models` 前 3 个。手机上一打开先展开历史列表。
 - 流式输出只重画对应的那一条回答（`renderTurn`），不动输入框。
 - `md()` 是自己写的极简 Markdown 渲染（先转义再替换，安全）；`linkMap` 把回答里的本地路径换成 `/api/files/<id>`。
 - 文件卡片、预览、diff：`outputsHTML / previewFile / diffHTML`。
@@ -69,7 +71,7 @@
 
 ```bash
 npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
-node dev/smoke-test.mjs  # 另开终端，30 项冒烟测试，不花额度
+node dev/smoke-test.mjs  # 另开终端，31 项冒烟测试，不花额度
 npm run check            # 只做语法检查
 ```
 
@@ -104,7 +106,7 @@ npm run check            # 只做语法检查
 - [ ] `brew install node`，`node -v` ≥ 18
 - [ ] `claude` 登录；`codex login`
 - [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
-- [ ] `node dev/smoke-test.mjs` 30 项全过
+- [ ] `node dev/smoke-test.mjs` 31 项全过
 - [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
 - [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
 - [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览
