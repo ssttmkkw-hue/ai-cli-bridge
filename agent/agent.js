@@ -16,7 +16,7 @@ const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
 cfg.relayUrl = (process.env.RELAY_URL || cfg.relayUrl || 'http://127.0.0.1:5227').replace(/\/$/, '');
 cfg.token = process.env.AGENT_TOKEN || cfg.token;
 cfg.name ||= os.hostname();
-cfg.maxConcurrent ||= 2;
+cfg.maxConcurrent ||= 3;
 cfg.taskTimeoutMin ||= 30;
 const IS_WIN = process.platform === 'win32';
 const expandHome = p => p && p.replace(/^~(?=$|[\\/])/, os.homedir());
@@ -105,7 +105,9 @@ const MIME = {
 };
 const extOf = f => path.extname(f).slice(1).toLowerCase();
 const mimeOf = f => MIME[extOf(f)] || 'application/octet-stream';
-const isTextFile = f => { const m = mimeOf(f); return m.startsWith('text/') || /json|xml|svg/.test(m) || ['gitignore', 'dockerfile', 'makefile'].includes(path.basename(f).toLowerCase()); };
+// 只认真正的文本类型：docx/xlsx/pptx 的 MIME 里也带 "xml"，但它们是 zip 二进制
+const TEXT_MIME = /^text\/|^application\/(json|xml)$|\+(json|xml)$/;
+const isTextFile = f => { const m = mimeOf(f); return TEXT_MIME.test(m) || ['gitignore', 'dockerfile', 'makefile'].includes(path.basename(f).toLowerCase()); };
 const SNAP_MAX_FILES = 20000, SNAP_TEXT_MAX = 200 * 1024, SNAP_TEXT_TOTAL = 20 * 1024 * 1024;
 const MAX_UPLOAD = 25 * 1024 * 1024, MAX_UPLOAD_FILES = 30, MAX_UPLOAD_TOTAL = 100 * 1024 * 1024;
 
@@ -231,7 +233,8 @@ for (const [kind, c] of Object.entries(cfg.clis || { claude: {}, codex: {} })) {
   clis[kind] = { ok: !!(bin && version), bin, version, models: c.models || [], prefixArgs: [] };
 }
 
-const workspaces = (cfg.workspaces || []).map(w => ({ name: w.name, path: path.resolve(expandHome(w.path)), maxLevel: w.maxLevel || 'full', note: w.note || '' }));
+// isolate: true → 每个对话在 <目录>/<用户名>/<对话id>/ 里运行，同一目录的多个任务可以同时跑、产出互不串
+const workspaces = (cfg.workspaces || []).map(w => ({ name: w.name, path: path.resolve(expandHome(w.path)), maxLevel: w.maxLevel || 'full', note: w.note || '', isolate: !!w.isolate }));
 for (const w of workspaces) if (!fs.existsSync(w.path)) { fs.mkdirSync(w.path, { recursive: true }); console.log(`[agent] 已创建工作目录 ${w.path}`); }
 if (!workspaces.length) { console.error('[agent] 至少配置一个 workspaces'); process.exit(1); }
 
@@ -276,9 +279,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function hello() {
   await api('POST', '/api/agent/hello', {
     name: cfg.name, platform: process.platform, hostname: os.hostname(), version: VERSION,
-    maxConcurrent: cfg.maxConcurrent, running: [...running.keys()],
+    maxConcurrent: cfg.maxConcurrent, running: [...running.keys()], confine: CONFINE,
     clis: Object.fromEntries(Object.entries(clis).map(([k, c]) => [k, { ok: c.ok, version: c.version, models: c.models }])),
-    workspaces: workspaces.map(({ name, maxLevel, note }) => ({ name, maxLevel, note })),
+    workspaces: workspaces.map(({ name, maxLevel, note, isolate }) => ({ name, maxLevel, note, isolate })),
   });
 }
 
@@ -474,6 +477,59 @@ async function collectOutputs(t, ws, before, answerText) {
   return { outputs, linkMap, partial: after.partial };
 }
 
+// ---------------------------------------------------------------- 文件夹限制（macOS 沙盒）
+// 「只读问答 / 可改文件」级别的 CLI 用 sandbox-exec 启动，由系统内核拒绝它读写允许范围以外的文件
+// （Claude Code 自己的权限设置拦不住读取：Read 工具能读本机任何文件）。「完全放开」不限制。
+// 允许范围：isolate 目录是 <目录>/<用户名>/（这个用户的所有对话），否则是目录本身。
+const CONFINE = process.platform === 'darwin' && cfg.confine !== false && fs.existsSync('/usr/bin/sandbox-exec');
+const CONFINE_CLIS = new Set(['claude', 'mock']); // Codex 自带沙盒，嵌套沙盒会失败，暂不支持
+console.log(CONFINE ? '[agent] 文件夹限制：开（只读问答 / 可改文件 只能访问自己的文件夹）' : '[agent] 文件夹限制：关（只读问答也能读本机其他文件）');
+if (CONFINE && clis.codex?.ok) console.log('[agent] ⚠ Codex 暂不受文件夹限制，多人使用时不要把 Codex 分给别人');
+const HOME = os.homedir();
+const sbq = s => JSON.stringify(String(s)); // SBPL 字符串字面量
+const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function confineReadPaths(kind) {
+  const c = clis[kind]; const out = [...(cfg.confineExtraRead || []).map(p => path.resolve(expandHome(p)))];
+  if (!c?.bin) return out;
+  out.push(c.bin);
+  try { const real = fs.realpathSync(c.bin); out.push(real, path.dirname(real)); } catch {}
+  for (const a of c.prefixArgs || []) if (fs.existsSync(a)) {
+    out.push(a); // 模拟 CLI 的脚本；Node 启动脚本时会逐级找 package.json 判断模块类型
+    for (let p = path.dirname(a); p !== path.dirname(p); p = path.dirname(p)) out.push(path.join(p, 'package.json'));
+  }
+  if (kind === 'claude') out.push(path.join(HOME, '.local', 'share', 'claude'));
+  return out;
+}
+function sandboxProfile(root, wd, kind) {
+  const readPaths = confineReadPaths(kind);
+  // 放开的路径的每一级上级目录都要允许「看属性」（不能列内容）：程序解析路径时会逐级 lstat
+  const ancestors = new Set();
+  for (const p0 of [root, ...readPaths]) for (let p = path.dirname(p0); p !== path.dirname(p); p = path.dirname(p)) ancestors.add(p);
+  // Claude Code 的会话记录按目录存在 ~/.claude/projects/<路径里非字母数字换成 -> 下，只放开这个对话自己的
+  const proj = path.join(HOME, '.claude', 'projects', wd.replace(/[^a-zA-Z0-9]/g, '-'));
+  const sub = list => list.map(p => `(subpath ${sbq(p)})`).join(' ');
+  const lit = list => list.map(p => `(literal ${sbq(p)})`).join(' ');
+  return `(version 1)
+(allow default)
+(deny file-read* file-write* ${sub([HOME, ...workspaces.map(w => w.path), path.resolve(__dirname, '..')])})
+(allow file-read-metadata ${lit([...ancestors, HOME, path.join(HOME, '.claude'), path.join(HOME, '.claude', 'projects'), path.join(HOME, '.local'), path.join(HOME, '.local', 'bin')])})
+(allow file-read* file-write* ${sub([root, proj, path.join(HOME, '.cache', 'claude'), path.join(HOME, '.local', 'state', 'claude'), path.join(HOME, 'Library', 'Caches', 'claude-cli-nodejs')])}
+  (regex ${sbq('^' + reEsc(path.join(HOME, '.claude.json')))}))
+(allow file-read* ${sub([path.join(HOME, 'Library', 'Keychains')])} ${lit([path.join(HOME, '.claude', 'settings.json')])}
+  ${readPaths.map(p => fs.existsSync(p) && fs.statSync(p).isDirectory() ? `(subpath ${sbq(p)})` : `(literal ${sbq(p)})`).join(' ')})
+`;
+}
+
+// 任务实际运行的目录：普通目录就是它本身；isolate 目录是 <目录>/<用户名>/<对话id>
+const safeSeg = s => String(s || '').replace(/[^\wÀ-￿.-]/g, '_').replace(/^\.+/, '_').slice(0, 60) || '_';
+function taskDir(ws, t) {
+  if (!ws.isolate) return ws.path;
+  if (!t.convId) throw new Error('中继版本太旧，缺少对话 id，无法使用独立子文件夹');
+  const d = path.join(ws.path, safeSeg(t.username), safeSeg(t.convId));
+  if (!inside(d, ws.path)) throw new Error('子文件夹路径不合法');
+  return d;
+}
+
 async function startTask(t) {
   const emit = patch => queueUpdate(t.id, patch);
   const ws = workspaces.find(w => w.name === t.workspace);
@@ -494,19 +550,30 @@ async function startTask(t) {
   running.set(t.id, job); // 先占位，保证并发计数准确
   emit({ status: 'running' });
 
-  let cmd, prompt, before;
+  let cmd, prompt, before, ews; // ews：这次任务实际使用的目录（isolate 时是对话的子文件夹）
   try {
     if (!ws) throw new Error('工作目录不存在：' + t.workspace);
     const lv = ['read', 'edit', 'full'];
     if (lv.indexOf(t.level) > lv.indexOf(ws.maxLevel)) throw new Error('该目录不允许此权限级别');
-    prompt = await prepareInputs(t, ws, emit);
+    ews = { ...ws, path: taskDir(ws, t) };
+    if (!fs.existsSync(ews.path)) {
+      fs.mkdirSync(ews.path, { recursive: true });
+      // Claude Code 的会话按目录保存：目录刚改成独立子文件夹时，旧会话在新目录里续接不上，只能重新开始
+      if (ws.isolate && t.resumeSessionId) { t.resumeSessionId = null; emit({ events: [{ k: 'info', d: '这个目录改成了每个对话独立文件夹，之前的上下文接不上，这条消息开始新会话' }] }); }
+    }
+    prompt = await prepareInputs(t, ews, emit);
     cmd = buildCommand(t);
-    before = snapshot(ws.path);
+    if (CONFINE && t.level !== 'full' && CONFINE_CLIS.has(t.cli)) {
+      const root = ws.isolate ? path.dirname(ews.path) : ws.path;
+      cmd = { bin: '/usr/bin/sandbox-exec', args: ['-p', sandboxProfile(root, ews.path, t.cli), cmd.bin, ...cmd.args] };
+      emit({ events: [{ k: 'info', d: `文件访问限制在：${ws.name}${root === ws.path ? '' : '/' + path.relative(ws.path, root)}/` }] });
+    }
+    before = snapshot(ews.path);
   } catch (e) { return finish({ status: 'failed', error: e.message }); }
   if (cancelled) return finish({ status: 'cancelled', error: '已手动停止' });
 
-  console.log(`[agent] ▶ ${t.id} ${t.cli}/${t.level} @${ws.name}${t.resumeSessionId ? ' (续接)' : ''}${t.inputs?.length ? ` +${t.inputs.length}附件` : ''}`);
-  child = spawn(cmd.bin, cmd.args, { cwd: ws.path, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'], detached: !IS_WIN, windowsHide: true });
+  console.log(`[agent] ▶ ${t.id} ${t.cli}/${t.level} @${ws.name}${ws.isolate ? '/' + path.relative(ws.path, ews.path) : ''}${t.resumeSessionId ? ' (续接)' : ''}${t.inputs?.length ? ` +${t.inputs.length}附件` : ''}`);
+  child = spawn(cmd.bin, cmd.args, { cwd: ews.path, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'], detached: !IS_WIN, windowsHide: true });
   let answerText = '';
   const parser = makeParser(t.cli, patch => {
     for (const e of patch.events || []) if (e.k === 'text') answerText += e.d;
@@ -549,7 +616,7 @@ async function startTask(t) {
       error = st.errorMsg || tail || `退出码 ${code}`;
     }
     try {
-      const { outputs, linkMap, partial } = await collectOutputs(t, ws, before, answerText || st.result || '');
+      const { outputs, linkMap, partial } = await collectOutputs(t, ews, before, answerText || st.result || '');
       if (outputs.length) emit({ outputs, linkMap });
       if (partial) emit({ events: [{ k: 'info', d: '工作目录文件太多，只检查了前 20000 个文件的变化' }] });
       if (outputs.length) console.log(`[agent]   产出 ${outputs.length} 个文件`);

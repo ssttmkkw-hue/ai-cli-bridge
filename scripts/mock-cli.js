@@ -28,6 +28,14 @@ process.stdin.on('end', async () => {
     out({ type: 'item.completed', item: { type: 'file_change', changes: [{ kind: 'add', path: 'chart.svg' }, { kind: 'add', path: 'report.html' }, { kind: 'update', path: 'notes.md' }] } });
     extra = '\n\n生成的图表：\n\n![柱状图](./chart.svg)\n\n完整报告见 [report.html](report.html)';
   }
+  // 读写探针：「读取:路径」「写入:路径」真的去读写，用来测文件夹限制
+  const probes = [];
+  for (const [, op, p] of input.matchAll(/(读取|写入)[:：](\S+)/g)) {
+    const fs = require('fs');
+    try { if (op === '读取') fs.readFileSync(p); else fs.writeFileSync(p, 'probe\n'); probes.push(`${op} ${p}：成功`); }
+    catch (e) { probes.push(`${op} ${p}：失败 ${e.code || e.message}`); }
+  }
+  if (probes.length) extra += '\n\n' + probes.join('\n');
   const att = input.match(/\[用户附件\][\s\S]*/);
   if (att) extra += '\n\n收到附件：\n' + att[0].split('\n').slice(1).join('\n');
   // 分段回复：工具调用之后连续多段文本，会落进 agent 的同一批上报，用来测实时推送不重复

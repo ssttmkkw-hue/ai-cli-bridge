@@ -90,6 +90,59 @@ document.addEventListener('click', e => {
 // ============================================================ 状态
 const S = { me: null, view: 'chat', agents: [], agentToken: null, convs: [], conv: null, tasks: new Map(), allTasks: [], taskFilter: '', users: [], es: null, sideOpen: false };
 
+// ============================================================ 偏好设置（存在本浏览器，手机和电脑可以各设各的）
+const PREF_DEFAULTS = { sendKey: 'enter', rememberNewConv: true };
+const SEND_KEYS = {
+  enter: { name: 'Enter 发送', desc: 'Shift+Enter 换行' },
+  mod: { name: 'Ctrl/⌘ + Enter 发送', desc: 'Enter 换行，适合经常写多行的人' },
+};
+function loadJSON(k, d) { try { return { ...d, ...JSON.parse(localStorage.getItem(k) || '{}') }; } catch { return { ...d }; } }
+let PREFS = loadJSON('aib.prefs', PREF_DEFAULTS);
+function savePrefs(p) { PREFS = { ...PREFS, ...p }; localStorage.setItem('aib.prefs', JSON.stringify(PREFS)); }
+const sendKeyHint = () => `${SEND_KEYS[PREFS.sendKey]?.name || SEND_KEYS.enter.name}，${SEND_KEYS[PREFS.sendKey]?.desc || SEND_KEYS.enter.desc}`;
+function isSendKey(e) {
+  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return false; // 输入法选词时的回车不算
+  return PREFS.sendKey === 'mod' ? (e.ctrlKey || e.metaKey) : !(e.shiftKey || e.altKey);
+}
+
+// ============================================================ 模型列表
+// 别名会自动跟随该系列的最新版本；agent 配置里的 models 会合并进来
+const KNOWN_MODELS = {
+  claude: {
+    alias: [['fable', 'Fable'], ['opus', 'Opus'], ['sonnet', 'Sonnet'], ['haiku', 'Haiku（最省额度）']],
+    pinned: [['claude-fable-5-2', 'Fable 5.2'], ['claude-opus-5-5', 'Opus 5.5'], ['claude-sonnet-5-5', 'Sonnet 5.5'], ['claude-haiku-5-5', 'Haiku 5.5']],
+  },
+};
+function modelOptions(cli, agentModels = []) {
+  const k = KNOWN_MODELS[cli] || { alias: [], pinned: [] };
+  const known = new Set([...k.alias, ...k.pinned].map(([v]) => v));
+  return { alias: k.alias, pinned: k.pinned, extra: agentModels.filter(v => v && !known.has(v)).map(v => [v, v]) };
+}
+// 模型下拉：CLI 默认 / 别名 / 固定版本 / 本机配置 / 自定义…
+function modelField(cli, agentModels, cur) {
+  const o = modelOptions(cli, agentModels);
+  const all = [...o.alias, ...o.pinned, ...o.extra].map(([v]) => v);
+  const custom = !!cur && !all.includes(cur);
+  const opt = ([v, n]) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(n)}${n !== v ? ` · ${esc(v)}` : ''}</option>`;
+  const grp = (label, list) => list.length ? `<optgroup label="${label}">${list.map(opt).join('')}</optgroup>` : '';
+  return `<div class="field"><span>模型</span>
+    <select class="input" data-model-sel>
+      <option value="" ${!cur ? 'selected' : ''}>CLI 默认</option>
+      ${grp('别名（自动用最新版本）', o.alias)}${grp('固定版本', o.pinned)}${grp('本机配置', o.extra)}
+      <option value="__custom" ${custom ? 'selected' : ''}>自定义…</option>
+    </select>
+    <input class="input" data-model-custom placeholder="输入模型名，例如 claude-opus-5-5" value="${custom ? esc(cur) : ''}" style="margin-top:6px;${custom ? '' : 'display:none'}"></div>`;
+}
+function bindModelField(root) {
+  const sel = root.querySelector('[data-model-sel]'), inp = root.querySelector('[data-model-custom]');
+  if (!sel) return;
+  sel.onchange = () => { const c = sel.value === '__custom'; inp.style.display = c ? '' : 'none'; if (c) inp.focus(); };
+}
+function readModelField(root) {
+  const sel = root.querySelector('[data-model-sel]'); if (!sel) return null;
+  return (sel.value === '__custom' ? root.querySelector('[data-model-custom]').value.trim() : sel.value) || null;
+}
+
 async function boot() {
   try { const r = await api('GET', '/api/me'); S.me = r.user; } catch { S.me = null; }
   const h = location.hash.slice(1); if (['chat', 'tasks', 'agents', 'users'].includes(h)) S.view = h;
@@ -146,12 +199,13 @@ function render() {
       <div class="brand"><i>&gt;_</i><span>AI 遥控台</span></div>
       <nav class="nav">${tabs.map(([k, n]) => `<button data-v="${k}" class="${S.view === k ? 'on' : ''}">${n}</button>`).join('')}</nav>
       <div class="me"><span class="dot" id="headDot"></span><span class="name">${esc(S.me.username)}</span>
-        <button class="icon-btn" id="pwBtn" title="改密码">🔑</button><button class="icon-btn" id="logout" title="退出">⏻</button></div>
+        <button class="icon-btn" id="prefBtn" title="偏好设置">⚙</button><button class="icon-btn" id="pwBtn" title="改密码">🔑</button><button class="icon-btn" id="logout" title="退出">⏻</button></div>
     </header>
     <div class="main" id="main"></div>`;
-  app.querySelectorAll('.nav button').forEach(b => b.onclick = () => { S.view = b.dataset.v; location.hash = S.view; render(); });
+  app.querySelectorAll('.nav button').forEach(b => b.onclick = () => { S.view = b.dataset.v; S.sideOpen = false; location.hash = S.view; render(); });
   $('#logout').onclick = async () => { await api('POST', '/api/logout'); S.es?.close(); S.me = null; render(); };
   $('#pwBtn').onclick = changePassword;
+  $('#prefBtn').onclick = prefsDialog;
   updateHeadAgent();
   renderView();
 }
@@ -189,6 +243,22 @@ function changePassword() {
   async () => { await tryApi('POST', '/api/me/password', { old: $('#pwOld').value, password: $('#pwNew').value }); toast('密码已修改'); });
 }
 
+function prefsDialog() {
+  const m = modal(`<h3>偏好设置</h3>
+    <p class="muted" style="margin:-6px 0 14px;font-size:13px">只保存在这个浏览器里，手机和电脑可以分别设置。</p>
+    <div class="field"><span>发送消息</span><div class="levels">${Object.entries(SEND_KEYS).map(([k, v]) => `<label class="level ${PREFS.sendKey === k ? 'on' : ''}">
+      <input type="radio" name="sendKey" value="${k}" ${PREFS.sendKey === k ? 'checked' : ''}><div><b>${v.name}</b><small>${v.desc}</small></div></label>`).join('')}</div></div>
+    <div class="field"><span>新对话</span><label class="checks"><label><input type="checkbox" id="pRemember" ${PREFS.rememberNewConv ? 'checked' : ''}>记住上次选的设备、CLI、模型、目录和权限</label></label></div>`,
+  async () => {
+    const remember = $('#pRemember').checked;
+    savePrefs({ sendKey: m.querySelector('input[name=sendKey]:checked')?.value || 'enter', rememberNewConv: remember });
+    if (!remember) localStorage.removeItem('aib.lastConv');
+    const ta = $('#input'); if (ta) ta.title = sendKeyHint();
+    toast('已保存');
+  }, { okText: '保存' });
+  m.querySelectorAll('input[name=sendKey]').forEach(r => r.onchange = () => m.querySelectorAll('.level').forEach(l => l.classList.toggle('on', l.querySelector('input').checked)));
+}
+
 // ============================================================ 弹窗
 function modal(inner, onOk, { okText = '确定', wide = false, noFoot = false } = {}) {
   const m = document.createElement('div'); m.className = 'mask';
@@ -210,8 +280,10 @@ function viewChat(m) {
       <div class="side-head"><button class="btn primary" id="newConv">＋ 新对话</button></div>
       <div class="convs" id="convList"></div>
     </aside>
+    <div class="side-mask ${S.sideOpen ? 'open' : ''}" id="sideMask"></div>
     <section class="chat" id="chat"></section>`;
-  $('#newConv').onclick = newConvDialog;
+  $('#newConv').onclick = () => { setSide(false); newConvDialog(); };
+  $('#sideMask').onclick = () => setSide(false);
   renderConvList();
   renderChat();
 }
@@ -227,7 +299,7 @@ function renderConvList() {
       <div class="t">${running.has(c.id) ? '<span class="spin" style="color:var(--accent);width:10px;height:10px"></span>' : ''}${esc(c.title)}</div>
       <div class="s">${esc(convSub(c))} · ${fmtTime(c.updatedAt)}</div></div>`).join('')
     : '<div class="empty">还没有对话<br>点上面「新对话」开始</div>';
-  el.querySelectorAll('.conv').forEach(d => d.onclick = () => { openConv(d.dataset.id); S.sideOpen = false; $('#side')?.classList.remove('open'); });
+  el.querySelectorAll('.conv').forEach(d => d.onclick = () => { setSide(false); openConv(d.dataset.id); });
 }
 async function openConv(id) {
   const r = await tryApi('GET', '/api/convs/' + id);
@@ -266,7 +338,7 @@ function renderChat() {
       <div class="composer-inner">
         <button class="icon-btn attach" id="attachBtn" title="添加附件（也可以粘贴或拖进来）">📎</button>
         <input type="file" id="fileInput" multiple hidden>
-        <textarea id="input" rows="1" placeholder="给 ${esc(CLI_NAME[c.cli] || c.cli)} 发消息…" title="Enter 发送，Shift+Enter 换行"></textarea>
+        <textarea id="input" rows="1" placeholder="给 ${esc(CLI_NAME[c.cli] || c.cli)} 发消息…" title="${esc(sendKeyHint())}"></textarea>
         <button class="btn primary" id="sendBtn">发送</button>
       </div>
       <div class="hint" id="hint"></div>
@@ -280,7 +352,7 @@ function renderChat() {
   scrollBottom(true);
   const ta = $('#input');
   ta.oninput = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 220) + 'px'; };
-  ta.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !matchMedia('(max-width:760px)').matches) { e.preventDefault(); sendMsg(); } };
+  ta.onkeydown = e => { if (isSendKey(e)) { e.preventDefault(); sendMsg(); } };
   $('#sendBtn').onclick = sendMsg;
   $('#attachBtn').onclick = () => $('#fileInput').click();
   $('#fileInput').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
@@ -332,7 +404,10 @@ function renderPending() {
     renderPending();
   });
 }
-function toggleSide() { S.sideOpen = !S.sideOpen; $('#side')?.classList.toggle('open', S.sideOpen); }
+// 手机布局下的对话列表抽屉：点遮罩、选对话、新建对话、切页面、按 Esc 都会收起
+function setSide(open) { S.sideOpen = open; $('#side')?.classList.toggle('open', open); $('#sideMask')?.classList.toggle('open', open); }
+function toggleSide() { setSide(!S.sideOpen); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && S.sideOpen) setSide(false); });
 function updateComposer() {
   const hint = $('#hint'); if (!hint || !S.conv) return;
   const agent = S.agents.find(a => a.name === S.conv.agent);
@@ -370,7 +445,8 @@ const kindOf = f => {
   if (m === 'application/pdf') return 'pdf';
   if (m.startsWith('audio/')) return 'audio';
   if (m.startsWith('video/')) return 'video';
-  if (m.startsWith('text/') || /json|xml|svg/.test(m)) return 'text';
+  // docx/xlsx/pptx 的 MIME 里也带 "xml"，但它们是 zip 二进制，不能当文本显示
+  if (/^text\/|^application\/(json|xml)$|\+(json|xml)$/.test(m)) return 'text';
   return 'other';
 };
 const ICON = { image: '🖼', html: '🌐', pdf: '📕', audio: '🎵', video: '🎬', text: '📄', other: '📦' };
@@ -495,6 +571,7 @@ function renderTurn(id, streaming) {
     <div class="reply">
       <div class="reply-head"><span class="chip ${t.status}">${active ? '<span class="spin"></span>' : ''}${ST[t.status]}${t.cancelRequested && active ? ' · 停止中' : ''}</span>
         <span>${fmtTime(t.createdAt)}</span>
+        ${t.status === 'queued' && t.waitingFor === 'workspace' ? `<span class="faint">「${esc(t.workspace)}」目录里有别的任务在跑，等它结束后自动开始</span>` : ''}
         ${active ? `<button class="btn sm danger" data-cancel="${t.id}" ${t.cancelRequested ? 'disabled' : ''}>${t.cancelRequested ? '停止中…' : '停止'}</button>` : ''}
         ${['failed', 'cancelled'].includes(t.status) ? `<button class="btn sm" data-retry="${t.id}">重试</button>` : ''}</div>
       ${eventsHTML(t.events || [], t.linkMap)}
@@ -521,16 +598,19 @@ function convMenu() {
   const lvls = allowedLevels(S.agents.find(a => a.name === c.agent), c.workspace);
   const m = modal(`<h3>对话设置</h3>
     <label class="field"><span>标题</span><input class="input" id="cTitle" value="${esc(c.title)}"></label>
+    ${modelField(c.cli, S.agents.find(a => a.name === c.agent)?.clis?.[c.cli]?.models || [], c.model)}
     <div class="field"><span>权限级别</span>${levelPicker(lvls, c.level)}</div>
     <div class="field"><span>上下文</span><div class="muted" style="font-size:14px">${c.sessionId ? `已接续 CLI 会话 <code>${esc(c.sessionId.slice(0, 13))}…</code>，后续消息会带上之前的上下文。` : '还没有会话，下一条消息会新开。'}</div>
       ${c.sessionId ? '<label class="checks"><label><input type="checkbox" id="cReset">清空上下文（下一条消息开新会话）</label></label>' : ''}</div>
     <div style="border-top:1px solid var(--line);padding-top:12px;margin-top:4px"><button class="btn danger" id="cDel">删除这个对话</button></div>`,
   async () => {
     const level = m.querySelector('input[name=lv]:checked')?.value;
-    const r = await tryApi('PATCH', '/api/convs/' + c.id, { title: $('#cTitle').value, level, resetSession: $('#cReset')?.checked });
+    if (m.querySelector('[data-model-sel]')?.value === '__custom' && !readModelField(m)) { toast('请输入自定义模型名，或改回「CLI 默认」', true); throw new Error(); }
+    const r = await tryApi('PATCH', '/api/convs/' + c.id, { title: $('#cTitle').value, model: readModelField(m), level, resetSession: $('#cReset')?.checked });
     Object.assign(S.conv, r.conv); Object.assign(S.convs.find(x => x.id === c.id) || {}, r.conv);
     renderConvList(); renderChat();
   }, { okText: '保存' });
+  bindModelField(m);
   bindLevelPicker(m);
   $('#cDel').onclick = async () => {
     if (!confirm('删除这个对话和它的全部记录？')) return;
@@ -561,30 +641,36 @@ async function newConvDialog() {
   if (!agents.length) return toast('还没有任何设备连上来，先在 Mac 上启动 agent', true);
   const m = modal(`<h3>新对话</h3><div id="ncBody"></div>`, async () => {
     const g = id => m.querySelector(id)?.value;
-    const body = { agent: g('#ncAgent'), cli: g('#ncCli'), workspace: g('#ncWs'), model: g('#ncModel') || null, level: m.querySelector('input[name=lv]:checked')?.value };
+    const body = { agent: g('#ncAgent'), cli: g('#ncCli'), workspace: g('#ncWs'), model: readModelField(m), level: m.querySelector('input[name=lv]:checked')?.value };
     if (!body.level) { toast('选一个权限级别', true); throw new Error(); }
+    if (m.querySelector('[data-model-sel]')?.value === '__custom' && !body.model) { toast('请输入自定义模型名，或改回「CLI 默认」', true); throw new Error(); }
     const r = await tryApi('POST', '/api/convs', body);
+    if (PREFS.rememberNewConv) localStorage.setItem('aib.lastConv', JSON.stringify({ agent: body.agent, cli: body.cli, ws: body.workspace, model: body.model, lv: body.level }));
     S.convs.unshift({ ...r.conv, username: S.me.username }); S.conv = r.conv; S.tasks = new Map();
     renderConvList(); renderChat(); $('#input')?.focus();
   }, { okText: '创建' });
-  const st = { agent: (agents.find(a => a.online) || agents[0]).name };
+  const last = PREFS.rememberNewConv ? loadJSON('aib.lastConv', {}) : {};
+  const st = { ...last, agent: agents.find(a => a.name === last.agent)?.name || (agents.find(a => a.online) || agents[0]).name };
   const draw = () => {
     const a = agents.find(x => x.name === st.agent);
     const clis = Object.entries(a.clis).filter(([, c]) => c.ok);
-    if (!clis.find(([k]) => k === st.cli)) st.cli = clis[0]?.[0];
+    if (!clis.find(([k]) => k === st.cli)) { st.cli = clis[0]?.[0]; st.model = null; }
     if (!a.workspaces.find(w => w.name === st.ws)) st.ws = a.workspaces[0]?.name;
     const models = a.clis[st.cli]?.models || [];
     const ws = a.workspaces.find(w => w.name === st.ws);
     m.querySelector('#ncBody').innerHTML = `
       <label class="field"><span>设备</span><select class="input" id="ncAgent">${agents.map(x => `<option value="${esc(x.name)}" ${x.name === st.agent ? 'selected' : ''}>${x.online ? '🟢' : '⚪'} ${esc(x.name)}（${esc(x.platform || '')}）</option>`).join('')}</select></label>
       <label class="field"><span>AI CLI</span><select class="input" id="ncCli">${clis.length ? clis.map(([k, c]) => `<option value="${k}" ${k === st.cli ? 'selected' : ''}>${esc(CLI_NAME[k] || k)} · ${esc(c.version || '')}</option>`).join('') : '<option value="">这台设备没有可用的 CLI</option>'}</select></label>
-      <label class="field"><span>模型（可选，留空用 CLI 默认）</span><input class="input" id="ncModel" list="ncModels" placeholder="${models.length ? '例如 ' + esc(models[0]) : '默认'}"><datalist id="ncModels">${models.map(x => `<option value="${esc(x)}">`).join('')}</datalist></label>
-      <label class="field"><span>工作目录</span><select class="input" id="ncWs">${a.workspaces.map(w => `<option value="${esc(w.name)}" ${w.name === st.ws ? 'selected' : ''}>${esc(w.name)}${w.note ? ' — ' + esc(w.note) : ''}</option>`).join('')}</select></label>
+      ${st.cli ? modelField(st.cli, models, st.model) : ''}
+      <label class="field"><span>工作目录</span><select class="input" id="ncWs">${a.workspaces.map(w => `<option value="${esc(w.name)}" ${w.name === st.ws ? 'selected' : ''}>${esc(w.name)}${w.note ? ' — ' + esc(w.note) : ''}${w.isolate ? '（每个对话独立文件夹）' : ''}</option>`).join('')}</select></label>
       <div class="field"><span>权限级别</span>${levelPicker(allowedLevels(a, st.ws), st.lv || 'read')}</div>
       ${a.online ? '' : '<div class="errbox">这台设备当前离线，消息会排队等它上线</div>'}`;
-    m.querySelector('#ncAgent').onchange = e => { st.agent = e.target.value; draw(); };
-    m.querySelector('#ncCli').onchange = e => { st.cli = e.target.value; draw(); };
-    m.querySelector('#ncWs').onchange = e => { st.ws = e.target.value; draw(); };
+    // 重画前记住当前选的模型，切设备/目录时不丢；切 CLI 时清空（不同 CLI 的模型不通用）
+    const keepModel = () => { if (m.querySelector('[data-model-sel]')) st.model = readModelField(m); };
+    m.querySelector('#ncAgent').onchange = e => { keepModel(); st.agent = e.target.value; draw(); };
+    m.querySelector('#ncCli').onchange = e => { st.cli = e.target.value; st.model = null; draw(); };
+    m.querySelector('#ncWs').onchange = e => { keepModel(); st.ws = e.target.value; draw(); };
+    bindModelField(m);
     bindLevelPicker(m);
     m.querySelectorAll('input[name=lv]').forEach(r => r.addEventListener('change', () => (st.lv = r.value)));
   };
@@ -670,7 +756,8 @@ function viewAgents(m) {
       <div class="faint" style="margin-bottom:8px">${esc(a.platform)} · ${esc(a.hostname || '')} · ${a.online ? '在线' : '离线，最后在线 ' + fmtTime(a.lastSeen)}</div>
       ${Object.entries(a.clis).map(([k, c]) => `<div class="row"><span>${esc(CLI_NAME[k] || k)}</span><span class="${c.ok ? '' : 'faint'}">${c.ok ? esc(c.version) : '不可用'}</span></div>`).join('')}
       <div class="row"><span>并发</span><span>${a.running.length} / ${a.maxConcurrent}</span></div>
-      <div class="row" style="display:block"><span>工作目录</span><div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${a.workspaces.map(w => `<span class="chip lv-${w.maxLevel}" title="${esc(w.note)}">📁 ${esc(w.name)} · 最高${LV[w.maxLevel]?.name}</span>`).join('')}</div></div>
+      <div class="row"><span>文件夹限制</span><span class="${a.confine ? '' : 'faint'}" title="开启时，只读问答 / 可改文件级别只能访问自己的文件夹（Codex 除外）">${a.confine ? '开' : '关'}</span></div>
+      <div class="row" style="display:block"><span>工作目录</span><div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${a.workspaces.map(w => `<span class="chip lv-${w.maxLevel}" title="${esc(w.note)}">📁 ${esc(w.name)} · 最高${LV[w.maxLevel]?.name}${w.isolate ? ' · 每个对话独立文件夹' : ''}</span>`).join('')}</div></div>
     </div>`).join('') : '<div class="card empty">还没有设备连上来</div>'}</div>
     ${admin ? `<h2 style="margin-top:28px">接入新设备</h2>
     <div class="card" style="padding:18px;margin-top:10px">

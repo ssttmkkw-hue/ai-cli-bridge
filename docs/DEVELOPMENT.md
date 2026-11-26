@@ -8,7 +8,7 @@
 - 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
 - Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
 - Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
-- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 22 项，全部通过。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 30 项，全部通过。
 
 ## 架构
 
@@ -29,7 +29,7 @@
 |---|---|
 | 存储 | `config.json`（agent token）、`users.json`、`db.json`（convs / tasks / uploads）、`sessions.json`（登录会话，只存 token 的 sha256）、`files/<id>`（文件本体）。`saveSoon()` 每秒落盘一次 |
 | 用户与权限 | scrypt 密码；`perms = { clis, agents, workspaces, maxLevel, dailyLimit }`，`'*'` 表示全部；`checkRunPerms()` 是建对话 / 发消息时的总闸 |
-| 派发 | `pickTasksFor(agent, free)`：同一对话串行（保证 resume 顺序），派出时带上 `conv.sessionId` 作为 `resumeSessionId`；`wakeAgent()` 立即返回挂着的长轮询 |
+| 派发 | `pickTasksFor(agent, free)`：同一对话串行（保证 resume 顺序）；同一设备的同一工作目录也串行（产出靠目录前后对比收集，并发会串到别的任务甚至别的用户），`isolate` 的目录除外（每个对话独立子文件夹）；因目录排队的任务带 `waitingFor: 'workspace'`；派发内容带 `convId`、`username` 供 agent 算子文件夹；派出时带上 `conv.sessionId` 作为 `resumeSessionId`；`wakeAgent()` 立即返回挂着的长轮询 |
 | 停止 | `cancelRequested` + `cancelSentAt`（指令只发一次，10 秒后补发一次）；30 秒还没停，中继直接判为已取消 |
 | 掉线 | 执行端 45 秒没轮询即视为离线；已派发的任务 90 秒没有回音就判失败；中继重启时正在跑的任务判失败 |
 | 文件 | `POST /api/agent/files`（agent 上传产出）、`GET /api/agent/files/:id`（agent 取附件）、`POST /api/uploads`（用户上传，需要 `X-Upload: 1` 头防 CSRF）、`GET /api/files/:id`（只有能看到这个任务的人能访问；HTML/SVG 带 `CSP: sandbox`） |
@@ -43,7 +43,9 @@
 | 命令行 | `buildCommand()`：权限三档 → CLI 参数；prompt 一律走 stdin；Codex 图片附件用 `-i` |
 | 解析输出 | `makeParser()` 把两家的 JSON 行统一成事件 `text / tool / tool_out / think / info / err`，并记下会话 ID |
 | 文件 | `snapshot()` 任务前后各拍一次（跳过 `.git`、`node_modules` 等，上限 2 万个文件，200KB 以下的文本连内容一起记）→ `diffSnapshots()` → `lineDiff()`（LCS）→ 上传；回答里 Markdown 引用的本地文件通过 `localLinks()` + `resolveLocal()` 找到，只允许工作目录内和 `extraOutputDirs` |
-| 附件 | `prepareInputs()` 下载到 `<工作目录>/.ai-bridge/uploads/<任务id>/`，把相对路径追加到 prompt |
+| 任务目录 | `taskDir()`：普通目录就是它本身；`isolate: true` 的目录是 `<目录>/<用户名>/<对话id>`（中继派发时带上 `convId`、`username`）。任务里的附件、快照、产出、`cwd` 都用这个目录（`ews`）。目录刚创建且带着旧会话 ID 时丢掉续接（Claude 会话按目录保存） |
+| 文件夹限制 | `CONFINE`（macOS + `cfg.confine !== false`）时，`read`/`edit` 级别的 claude 和 mock 用 `/usr/bin/sandbox-exec -p <sandboxProfile()>` 启动。规则顺序：允许一切 → 拒绝家目录、所有工作目录、项目目录 → 放开用户文件夹、本对话的 `~/.claude/projects/<编码后的cwd>`、`~/.claude.json*`、缓存 → 只读放开钥匙串、`settings.json`、CLI 自身（`confineReadPaths()`）。所有放开路径的上级目录允许 `file-read-metadata`（程序会逐级 lstat，被拒会当成异常）；mock 额外放开各级 `package.json`（Node 判断模块类型） |
+| 附件 | `prepareInputs()` 下载到 `<任务目录>/.ai-bridge/uploads/<任务id>/`，把相对路径追加到 prompt |
 | 停止 | `job.cancel()` 是幂等的；`killTree()`：Windows 用 `taskkill /T /F`，Mac 结束整个进程组；进程退出但 `close` 迟迟不来时有兜底 |
 
 ### web/app.js（前端）
@@ -67,7 +69,7 @@
 
 ```bash
 npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
-node dev/smoke-test.mjs  # 另开终端，22 项冒烟测试，不花额度
+node dev/smoke-test.mjs  # 另开终端，30 项冒烟测试，不花额度
 npm run check            # 只做语法检查
 ```
 
@@ -80,9 +82,10 @@ npm run check            # 只做语法检查
 - **Codex 回答不逐字输出**：`codex exec --json` 只在整段写完时给出 `agent_message`。要逐字输出需要换成 `codex app-server`。
 - **每条消息都重启 CLI**：会慢几秒，并且要重新读一遍历史。
 - **CLI 是否「可用」只看能不能运行**：没登录的 CLI 也显示可用，发消息时才报错。
-- **同一目录里的并发任务**：两个对话同时改同一个目录，产出文件会混在一起显示。
 - **内置预览面板（Claude 桌面 App）会拦截带 `sandbox` 属性的 iframe**，所以 HTML 预览改由服务端的 `CSP: sandbox` 响应头负责隔离，iframe 上不再加这个属性。普通浏览器两种写法都行。
 - **文件没有自动过期**：`data/files/` 只在删除对话时清理。
+- **Claude Code 的 `--permission-mode default` 不限制读取范围**：Read 工具能读工作目录以外的文件，所以靠 macOS 的 `sandbox-exec` 做文件夹限制（见上面「文件夹限制」）。Windows / Linux 上没有这层限制；Codex 和「完全放开」级别也没有。
+- **`sandbox-exec` 被苹果标为过时**，但 macOS 15 上仍可用；如果哪天被移除，agent 启动日志会显示「文件夹限制：关」。
 
 ## 接下来要做的（按优先级）
 
@@ -101,7 +104,7 @@ npm run check            # 只做语法检查
 - [ ] `brew install node`，`node -v` ≥ 18
 - [ ] `claude` 登录；`codex login`
 - [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
-- [ ] `node dev/smoke-test.mjs` 22 项全过
+- [ ] `node dev/smoke-test.mjs` 30 项全过
 - [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
 - [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
 - [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览

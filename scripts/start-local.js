@@ -11,10 +11,11 @@ if (!fs.existsSync(localCfg)) {
   fs.writeFileSync(localCfg, JSON.stringify({
     name: 'local-dev',
     relayUrl: `http://127.0.0.1:${port}`,
-    maxConcurrent: 2,
+    maxConcurrent: 3,
     clis: { claude: { bin: 'auto', models: ['sonnet', 'opus', 'haiku'] }, codex: { bin: 'auto' }, mock: { enabled: true } },
     workspaces: [
-      { name: '沙盒', path: path.join(ROOT, 'test-workspaces', 'sandbox'), maxLevel: 'full', note: '测试用目录' },
+      // 沙盒：每个对话独立子文件夹，可以同时跑；只读：共用一个目录，同一时间只跑一个任务
+      { name: '沙盒', path: path.join(ROOT, 'test-workspaces', 'sandbox'), maxLevel: 'full', isolate: true, note: '测试用目录' },
       { name: '只读', path: path.join(ROOT, 'test-workspaces', 'readonly'), maxLevel: 'read', note: '只读' },
     ],
   }, null, 2));

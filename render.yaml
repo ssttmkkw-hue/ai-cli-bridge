@@ -1,0 +1,22 @@
+# Render 部署配置（Blueprint）：把中继 + 网页部署成一个 Web Service，Mac 上只跑 agent。
+# 在 Render 控制台选 New → Blueprint，连上这个仓库即可。详见 README「中继放云上」一节。
+services:
+  - type: web
+    name: ai-cli-bridge
+    runtime: node
+    region: singapore        # 离日本最近的机房
+    plan: free               # 免费版磁盘不持久：重启/重新部署后对话和账号会清空（管理员和 agent token 靠下面的环境变量保持不变）
+    buildCommand: echo "没有依赖，不需要构建"
+    startCommand: node relay/server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: HOST
+        value: 0.0.0.0       # 让 Render 的代理连得进来
+      - key: TRUST_PROXY
+        value: "1"           # 前面有一层 Render 代理：登录限流按真实客户端 IP 计
+      - key: AGENT_TOKEN
+        generateValue: true  # Render 自动生成；Mac 上的 agent 配置填这个值
+      - key: ADMIN_PASSWORD
+        sync: false          # 创建时在控制台填写，至少 8 位

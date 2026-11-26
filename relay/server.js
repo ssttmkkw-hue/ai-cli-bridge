@@ -35,6 +35,12 @@ if (!config.agentToken) config.agentToken = crypto.randomBytes(24).toString('bas
 if (!config.sessionDays) config.sessionDays = 14;
 if (!config.taskOutputLimit) config.taskOutputLimit = 400000; // 单任务保存的输出事件字符上限
 writeJSONAtomic(files.config, config);
+// 部署到磁盘不持久的平台（例如 Render 免费版）时，用环境变量固定 agent token，重启后 Mac 不用重新配置
+const ENV_AGENT_TOKEN = process.env.AGENT_TOKEN || '';
+if (ENV_AGENT_TOKEN) {
+  if (ENV_AGENT_TOKEN.length < 24) { console.error('[relay] 环境变量 AGENT_TOKEN 太短（至少 24 位）'); process.exit(1); }
+  config.agentToken = ENV_AGENT_TOKEN; // 只放内存，不写进 config.json
+}
 
 let users = readJSON(files.users, []);
 const db = readJSON(files.db, { convs: [], tasks: [] });
@@ -115,15 +121,21 @@ function checkPassword(user, pw) {
 function newId(prefix) { return prefix + '_' + crypto.randomBytes(6).toString('hex'); }
 
 if (!users.length) {
-  const pw = crypto.randomBytes(6).toString('base64url');
+  // 没有任何账号时创建管理员；设了 ADMIN_PASSWORD 就用它（磁盘不持久的平台重启后仍是同一个密码）
+  const envPw = process.env.ADMIN_PASSWORD || '';
+  if (envPw && envPw.length < 8) { console.error('[relay] 环境变量 ADMIN_PASSWORD 太短（至少 8 位）'); process.exit(1); }
+  const pw = envPw || crypto.randomBytes(6).toString('base64url');
   users.push({
     id: newId('u'), username: 'admin', role: 'admin', disabled: false, createdAt: Date.now(),
     perms: { clis: ['*'], maxLevel: 'full', agents: ['*'], workspaces: ['*'], dailyLimit: 0 },
     ...hashPassword(pw),
   });
   writeJSONAtomic(files.users, users);
-  fs.writeFileSync(path.join(DATA_DIR, 'INITIAL_ADMIN.txt'), `用户名: admin\n初始密码: ${pw}\n登录后请到「用户权限」里改密码，然后删除本文件。\n`);
-  console.log(`\n[relay] 已创建管理员 admin，初始密码：${pw}（也写在 data/INITIAL_ADMIN.txt）\n`);
+  if (envPw) console.log('\n[relay] 已用环境变量 ADMIN_PASSWORD 创建管理员 admin\n');
+  else {
+    fs.writeFileSync(path.join(DATA_DIR, 'INITIAL_ADMIN.txt'), `用户名: admin\n初始密码: ${pw}\n登录后请到「用户权限」里改密码，然后删除本文件。\n`);
+    console.log(`\n[relay] 已创建管理员 admin，初始密码：${pw}（也写在 data/INITIAL_ADMIN.txt）\n`);
+  }
 }
 
 function publicUser(u) {
@@ -172,7 +184,16 @@ function currentUser(req) {
 
 // 简单登录限流：同 IP 10 分钟内失败 8 次即锁
 const loginFails = new Map();
-function ipOf(req) { return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(); }
+// 客户端 IP（登录限流用）。默认只认 TCP 连接的地址，完全不看 X-Forwarded-For —— 这个头谁都能伪造。
+// 中继前面确实有反向代理（Render、Nginx…）时设 TRUST_PROXY=代理层数：每层代理会在末尾追加它看到的地址，
+// 所以从右往左数第 N 个才是真实客户端；客户端自己伪造的内容永远在最左边，不会被采用。
+const TRUST_PROXY = Math.max(0, parseInt(process.env.TRUST_PROXY || '0', 10) || 0);
+function ipOf(req) {
+  const sock = req.socket.remoteAddress || '';
+  if (!TRUST_PROXY) return sock;
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
+  return xff.length >= TRUST_PROXY ? xff[xff.length - TRUST_PROXY] : sock;
+}
 
 // ---------------------------------------------------------------- agents（Mac 等执行端）
 const agents = new Map(); // name -> { name, platform, clis, workspaces, lastSeen, running:Set, waiter }
@@ -180,7 +201,7 @@ function agentOnline(a) { return a && Date.now() - a.lastSeen < 45000; }
 function publicAgent(a) {
   return {
     name: a.name, platform: a.platform, hostname: a.hostname, online: agentOnline(a),
-    clis: a.clis, workspaces: a.workspaces, maxConcurrent: a.maxConcurrent,
+    clis: a.clis, workspaces: a.workspaces, maxConcurrent: a.maxConcurrent, confine: !!a.confine,
     running: [...a.running], lastSeen: a.lastSeen, version: a.version,
   };
 }
@@ -236,17 +257,29 @@ function appendEvents(t, evs) {
 function pickTasksFor(agent, free) {
   const out = [];
   if (free <= 0) return out;
-  const busyConvs = new Set(db.tasks.filter(t => t.status === 'running' || t.status === 'dispatched').map(t => t.convId));
+  const active = db.tasks.filter(t => t.status === 'running' || t.status === 'dispatched');
+  const busyConvs = new Set(active.map(t => t.convId));
+  // 同一台设备的同一个工作目录一次只跑一个任务：agent 靠「任务前后目录对比」收集产出文件，
+  // 并发时会把别的任务（可能是别的用户）写的文件也算成自己的产出
+  // 开了 isolate（每个对话独立子文件夹）的目录不受这个限制，可以同时跑
+  const isoWs = new Set((agent.workspaces || []).filter(w => w.isolate).map(w => w.name));
+  const busyWs = new Set(active.filter(t => t.agent === agent.name && !isoWs.has(t.workspace)).map(t => t.workspace));
   for (const t of db.tasks) {
     if (out.length >= free) break;
     if (t.status !== 'queued' || t.agent !== agent.name || busyConvs.has(t.convId)) continue;
+    // 目录被占用：这条继续排队，同时挡住同一对话后面的消息，保证对话内顺序
+    if (busyWs.has(t.workspace)) {
+      busyConvs.add(t.convId);
+      if (t.waitingFor !== 'workspace') { t.waitingFor = 'workspace'; pushTask(t); } // 让网页显示在等什么
+      continue;
+    }
     const conv = convOf(t);
     if (!conv) { t.status = 'cancelled'; continue; }
-    t.status = 'dispatched'; t.dispatchedAt = Date.now();
+    t.status = 'dispatched'; t.dispatchedAt = Date.now(); delete t.waitingFor;
     t.resumeSessionId = conv.sessionId || null;
-    busyConvs.add(t.convId);
+    busyConvs.add(t.convId); if (!isoWs.has(t.workspace)) busyWs.add(t.workspace);
     out.push({
-      id: t.id, cli: t.cli, prompt: t.prompt, workspace: t.workspace, level: t.level,
+      id: t.id, convId: t.convId, username: userName(t.userId), cli: t.cli, prompt: t.prompt, workspace: t.workspace, level: t.level,
       model: t.model || null, resumeSessionId: t.resumeSessionId,
       inputs: (t.inputs || []).map(f => ({ id: f.id, name: f.name, mime: f.mime, size: f.size })),
     });
@@ -327,6 +360,7 @@ async function handle(req, res) {
   let mm;
 
   if (!p.startsWith('/api/')) return serveStatic(req, res, p);
+  if (p === '/api/health') return send(res, 200, { ok: true }); // 部署平台的健康检查，不需要登录
 
   // 防 CSRF：写操作必须是 JSON，或带自定义头的上传（跨站表单两者都发不出来，必触发预检）
   const isUpload = p === '/api/uploads' && req.headers['x-upload'] === '1';
@@ -341,7 +375,7 @@ async function handle(req, res) {
       const old = agents.get(b.name);
       const a = {
         name: String(b.name).slice(0, 40), platform: b.platform, hostname: b.hostname, version: b.version,
-        clis: b.clis || {}, workspaces: b.workspaces || [], maxConcurrent: b.maxConcurrent || 1,
+        clis: b.clis || {}, workspaces: b.workspaces || [], maxConcurrent: b.maxConcurrent || 1, confine: !!b.confine,
         lastSeen: Date.now(), running: old?.running || new Set(), waiter: null,
       };
       agents.set(a.name, a);
@@ -441,17 +475,25 @@ async function handle(req, res) {
 
   // ===== 登录 =====
   if (p === '/api/login' && m === 'POST') {
-    const ip = ipOf(req);
-    const lf = loginFails.get(ip) || { n: 0, t: Date.now() };
-    if (Date.now() - lf.t > 600000) { lf.n = 0; lf.t = Date.now(); }
+    // 两道限流，都是 10 分钟窗口：同一 IP 失败 8 次；同一账号失败 20 次（防换着 IP 猜同一个账号）
+    const counter = key => {
+      const c = loginFails.get(key) || { n: 0, t: Date.now() };
+      if (Date.now() - c.t > 600000) { c.n = 0; c.t = Date.now(); }
+      return c;
+    };
+    if (loginFails.size > 5000) for (const [k, c] of loginFails) if (Date.now() - c.t > 600000) loginFails.delete(k);
+    const ip = ipOf(req), lf = counter('ip:' + ip);
     if (lf.n >= 8) fail(429, '失败次数过多，10 分钟后再试');
     const b = await readBody(req);
     const u = users.find(x => x.username === String(b.username || '').trim());
+    const uf = u ? counter('user:' + u.id) : null; // 只给存在的账号计数，免得随便编的用户名把表撑大
+    if (uf && uf.n >= 20) fail(429, '这个账号失败次数过多，10 分钟后再试');
     if (!u || u.disabled || !checkPassword(u, b.password || '')) {
-      lf.n++; loginFails.set(ip, lf);
+      lf.n++; loginFails.set('ip:' + ip, lf);
+      if (uf) { uf.n++; loginFails.set('user:' + u.id, uf); }
       fail(401, '用户名或密码错误');
     }
-    loginFails.delete(ip);
+    loginFails.delete('ip:' + ip); loginFails.delete('user:' + u.id);
     const tok = crypto.randomBytes(32).toString('base64url');
     const maxAge = config.sessionDays * 86400;
     sessions.set(tok, { userId: u.id, exp: Date.now() + maxAge * 1000 });
@@ -507,7 +549,7 @@ async function handle(req, res) {
     checkRunPerms(user, b);
     const c = {
       id: newId('c'), userId: user.id, title: String(b.title || '新对话').slice(0, 60),
-      agent: b.agent, cli: b.cli, workspace: b.workspace, level: b.level, model: b.model || null,
+      agent: b.agent, cli: b.cli, workspace: b.workspace, level: b.level, model: b.model ? String(b.model).slice(0, 100) : null,
       sessionId: null, createdAt: Date.now(), updatedAt: Date.now(),
     };
     db.convs.push(c); saveSoon();
@@ -523,6 +565,7 @@ async function handle(req, res) {
     if (m === 'PATCH') {
       const b = await readBody(req);
       if (b.title) c.title = String(b.title).slice(0, 60);
+      if ('model' in b) c.model = b.model ? String(b.model).slice(0, 100) : null; // 换模型不影响上下文续接
       if (b.level) { checkRunPerms(user, { ...c, level: b.level }); c.level = b.level; }
       if (b.resetSession) c.sessionId = null;
       saveSoon(); return send(res, 200, { conv: c });
@@ -668,6 +711,7 @@ async function handle(req, res) {
   }
   if (p === '/api/agent-token/rotate' && m === 'POST') {
     if (!isAdmin) fail(403, '需要管理员');
+    if (ENV_AGENT_TOKEN) fail(400, 'agent token 由环境变量 AGENT_TOKEN 固定，请到部署平台修改');
     config.agentToken = crypto.randomBytes(24).toString('base64url');
     writeJSONAtomic(files.config, config);
     return send(res, 200, { agentToken: config.agentToken });
@@ -732,6 +776,7 @@ const server = http.createServer((req, res) => {
 server.requestTimeout = 0; // 长轮询/SSE 需要
 server.listen(PORT, HOST, () => {
   console.log(`[relay] 已启动 http://${HOST}:${PORT}`);
-  console.log(`[relay] agent token: ${config.agentToken}`);
+  console.log(`[relay] agent token: ${ENV_AGENT_TOKEN ? '（来自环境变量 AGENT_TOKEN，不在日志里显示）' : config.agentToken}`);
+  if (TRUST_PROXY) console.log(`[relay] 信任 ${TRUST_PROXY} 层反向代理的 X-Forwarded-For`);
 });
 module.exports = { server, config };

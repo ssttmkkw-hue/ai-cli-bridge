@@ -2,7 +2,7 @@
   "name": "mac-air",
   "relayUrl": "http://127.0.0.1:5227",
   "token": "粘贴中继「设备」页里显示的 agent token",
-  "maxConcurrent": 2,
+  "maxConcurrent": 3,
   "taskTimeoutMin": 30,
   "clis": {
     "claude": { "bin": "auto", "models": ["sonnet", "opus", "haiku"] },
@@ -10,7 +10,8 @@
     "mock": { "enabled": false }
   },
   "workspaces": [
-    { "name": "沙盒", "path": "~/ai-bridge/sandbox", "maxLevel": "full", "note": "随便折腾的目录" },
+    { "name": "沙盒", "path": "~/ai-bridge/sandbox", "maxLevel": "full", "isolate": true, "note": "随便折腾的目录" },
+    { "name": "问答", "path": "~/ai-bridge/qa", "maxLevel": "read", "isolate": true, "note": "问问题、看图片用" },
     { "name": "项目", "path": "~/Projects", "maxLevel": "edit", "note": "只允许改文件，不允许完全放开" },
     { "name": "只读资料", "path": "~/Documents", "maxLevel": "read", "note": "只能读不能改" }
   ]

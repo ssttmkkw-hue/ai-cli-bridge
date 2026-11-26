@@ -29,7 +29,7 @@ agent 是**主动连出去**领任务的，所以 Mac 放在家里路由器后�
 | `mac/install-mac.sh` | 在 Mac 上装成开机自启服务（launchd） |
 | `scripts/start-local.js` | 本地联调：一条命令同时起中继 + agent |
 | `scripts/mock-cli.js` | 假 CLI，不花额度测试整条链路 |
-| `dev/smoke-test.mjs` | 冒烟测试（22 项，只用假 CLI） |
+| `dev/smoke-test.mjs` | 冒烟测试（30 项，只用假 CLI） |
 | `docs/DEVELOPMENT.md` | 开发交接：代码地图、已知问题、下一步计划、Mac 验证清单 |
 | `data/` | 运行后生成：`config.json`（agent token）、`users.json`、`db.json`、`sessions.json`（登录会话）、`files/`（产出与附件）、`INITIAL_ADMIN.txt` |
 
@@ -41,7 +41,7 @@ npm run local        # 等同于 node scripts/start-local.js 5227
 
 打开 http://localhost:5227 ，管理员账号 `admin`，初始密码在 `data/INITIAL_ADMIN.txt`。
 本地联调会自动生成 `agent/agent.local.json`，带一个「模拟 CLI」和两个测试目录（`test-workspaces/sandbox` 可写、`test-workspaces/readonly` 只读）。
-另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 22 项功能，不花额度。
+另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 30 项功能，不花额度。
 
 ## 二、部署到 Mac Air
 
@@ -57,7 +57,9 @@ npm run local        # 等同于 node scripts/start-local.js 5227
    ```
    编辑 `agent/agent.config.json`：
    - `name`：设备名，例如 `mac-air`
-   - `workspaces`：**允许 AI 碰的目录**，每个目录可以限制最高权限（`read` / `edit` / `full`）
+   - `workspaces`：**允许 AI 碰的目录**，每个目录可以限制最高权限（`read` / `edit` / `full`）；加 `"isolate": true` 后每个对话在 `<目录>/<用户名>/<对话id>/` 里运行，同一目录的多个对话可以同时跑
+   - `maxConcurrent`：这台设备最多同时跑几个任务（默认 3）
+   - `confine`：文件夹限制，macOS 上默认开启；设成 `false` 关闭。CLI 装在不常见的位置、启动报 `EPERM` 时，把它的安装目录加进 `confineExtraRead`（数组）
    - `token`：中继和 agent 在同一台 Mac 上时保持原样即可，会自动读取
 5. 再运行一次 `bash mac/install-mac.sh both`，中继和 agent 都会开机自启，日志在 `logs/`。
 6. 防止睡眠掉线：`sudo pmset -c sleep 0 disablesleep 1`（插电时不睡）。合盖也要跑的话，建议外接电源并在「电池」设置里关掉自动睡眠。
@@ -83,6 +85,27 @@ npm run local        # 等同于 node scripts/start-local.js 5227
 想让中继 7×24 在线（Mac 关机时网页仍能打开、消息会排队），可以把 `relay/` + `web/` 部署到任意能跑 Node 的服务器（`HOST=0.0.0.0 PORT=5227 node relay/server.js`，前面套 HTTPS 反代）。
 Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 `relayUrl` 填中继地址，`token` 填网页「设备」页显示的 token。
 
+浏览器只访问中继（网页和接口同一个地址），Mac 是主动连出去领任务的，所以 Mac 不需要公网 IP，也不用开端口。
+
+中继可用的环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `HOST` / `PORT` | 监听地址和端口；云上要设 `HOST=0.0.0.0` |
+| `RELAY_DATA` | 数据目录（默认 `data/`），挂了持久磁盘就指过去 |
+| `TRUST_PROXY` | 前面有几层反向代理（Render 是 1）。不设时完全不看 `X-Forwarded-For`，防止伪造 IP 绕过登录限流 |
+| `AGENT_TOKEN` | 固定 agent token（至少 24 位）；不设则自动生成并存在 `data/config.json` |
+| `ADMIN_PASSWORD` | 没有任何账号时用它创建管理员 `admin`（至少 8 位）；不设则随机生成并写进 `data/INITIAL_ADMIN.txt` |
+
+#### 部署到 Render（仓库里有 `render.yaml`）
+
+1. Render 控制台 → **New → Blueprint**，连上 GitHub 仓库，选要部署的分支。
+2. 按 `render.yaml` 创建：新加坡机房、免费版、`node relay/server.js`。创建时会让你填 `ADMIN_PASSWORD`；`AGENT_TOKEN` 自动生成，在服务的 Environment 页能看到。
+3. 部署完成后打开 `https://<服务名>.onrender.com`，用 `admin` + 你填的密码登录。
+4. Mac 上 `agent/agent.config.json` 的 `relayUrl` 改成这个网址，`token` 填 `AGENT_TOKEN`，然后 `npm run agent`（或 `bash mac/install-mac.sh agent` 装成开机自启）。
+
+免费版的限制：磁盘不持久，**每次重启 / 重新部署后对话、上传的文件和你新建的账号都会清空**（管理员密码和 agent token 因为来自环境变量，保持不变，Mac 会自动重连）；一段时间没有请求会休眠，唤醒要几十秒（agent 一直在轮询，通常能保持唤醒）。长期使用请换付费实例并挂持久磁盘，把 `RELAY_DATA` 指到磁盘路径。
+
 ## 三、权限模型
 
 **用户层面**（网页「用户权限」页，管理员设置）：
@@ -95,6 +118,13 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 - 只有配置里列出的 `workspaces` 能被使用，网页只传目录**名字**，不能传任意路径
 - 每个目录的 `maxLevel` 是硬上限，即使管理员也越不过去
 
+**文件夹限制**（macOS，默认开启）：Claude Code 自己的权限设置拦不住读取（Read 工具能读本机任何文件），所以「只读问答 / 可改文件」级别的 CLI 用系统自带的 `sandbox-exec` 启动，由内核拒绝越界读写：
+- 只能读写**这个用户自己的文件夹**：开了 `isolate` 的目录是 `<目录>/<用户名>/`（他所有对话都在里面），否则是目录本身
+- 读不到：其他用户的文件夹、其他工作目录、本项目目录（含 `data/` 里的密码哈希和 agent token）、家目录下的其他文件、其他对话在 `~/.claude/projects/` 里的会话记录
+- 为了让 Claude Code 能跑，仍然放开：它自己的程序、`~/.claude.json`（含登录账号邮箱和项目列表）、`~/.claude/settings.json`、缓存目录、`~/Library/Keychains`（登录凭证，加密存储）
+- 不受限制：「完全放开」级别；Codex（自带沙盒，不能再套一层）——多人使用时不要把这两样分给别人
+- 受限时用不了你装在 `~/.claude/` 下的技能和插件
+
 **三档权限对应的 CLI 参数**：
 
 | 级别 | Claude Code | Codex |
@@ -106,7 +136,12 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 ## 四、对话与上下文
 
 每个对话绑定 设备 + CLI + 工作目录 + 权限级别。第一条消息会新开 CLI 会话，记下会话 ID；后续消息自动用 `claude --resume <id>` / `codex exec resume <id>` 接续上下文。
-同一对话的消息严格按顺序执行（前一条没完，后一条排队），不同对话可以并行（并发数由 agent 的 `maxConcurrent` 决定）。
+同一对话的消息严格按顺序执行（前一条没完，后一条排队）。产出文件靠「任务前后对比目录」收集，所以：
+- 开了 `isolate` 的目录：每个对话有自己的子文件夹，多个对话可以同时跑；
+- 没开的目录（比如真实项目目录，大家要改同一份代码）：同一时间只跑一个任务，其余排队，网页上会提示在等什么；
+- 不同目录之间可以并行。总并发数由 agent 的 `maxConcurrent` 决定。
+
+已有对话所在的目录改成 `isolate` 后，它的工作目录会变成新的子文件夹；Claude Code 的会话按目录保存，所以这类对话的下一条消息会自动开新会话。
 对话设置里可以「清空上下文」，下一条消息开新会话。
 
 ## 五、文件与图片

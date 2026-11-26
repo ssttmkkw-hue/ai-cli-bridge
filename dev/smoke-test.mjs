@@ -116,6 +116,64 @@ const fsvg = await fetch(B + '/api/files/' + svg.id, { headers: { cookie: (await
 ok(fsvg.status === 200 && fsvg.headers.get('content-security-policy')?.includes('sandbox'), 'SVG 带沙盒响应头');
 ok((await fetch(B + '/api/files/' + html.id)).status === 401, '未登录拿不到文件');
 
+// 3b. 并发与产出归属：产出靠「任务前后目录对比」收集，不能串到别的任务（可能是别的用户）
+//   - 开了 isolate 的目录：每个对话独立子文件夹，可以同时跑
+//   - 共用的目录：同一时间只跑一个，后来的排队
+{
+  const SLOW = '生成文件 慢一点'; // 模拟 CLI：先写 chart.svg / report.html / notes.md，再跑 10 秒
+  const FILES = ['chart.svg', 'report.html', 'notes.md'];
+  const conv = async (workspace, level, title) => (await A('POST', '/api/convs', { agent: AGENT, cli: 'mock', workspace, level, title })).j.conv;
+  const send = async (c, prompt) => (await A('POST', `/api/convs/${c.id}/send`, { prompt })).j.task;
+  const untilRunning = async id => { for (let i = 0; i < 40; i++) { if ((await A('GET', '/api/tasks/' + id)).j.task.status === 'running') return; await sleep(200); } };
+  const noForeign = r => !(r?.outputs || []).some(o => FILES.includes(o.name));
+  const wsOf = n => agent.workspaces?.find(w => w.name === n);
+
+  // 独立子文件夹：同一目录 3 个任务同时跑
+  if (wsOf(WS)?.isolate) {
+    const [ca, cb, cc] = [await conv(WS, 'edit', '并发A'), await conv(WS, 'edit', '并发B'), await conv(WS, 'edit', '并发C')];
+    const ta = await send(ca, SLOW); await untilRunning(ta.id);
+    const [tb, tc] = [await send(cb, '你好'), await send(cc, '你好')];
+    const [rb, rc] = [await waitTask(A, tb.id, 8000), await waitTask(A, tc.id, 8000)];
+    const aMid = (await A('GET', '/api/tasks/' + ta.id)).j.task.status;
+    ok(rb?.status === 'done' && rc?.status === 'done' && aMid === 'running', '独立子文件夹：同一目录 3 个任务同时跑', `A 还在 ${aMid}`);
+    ok(noForeign(rb) && noForeign(rc), '独立子文件夹：产出不串到别的对话');
+    await A('POST', `/api/tasks/${ta.id}/cancel`); await waitTask(A, ta.id, 15000);
+    for (const c of [ca, cb, cc]) await A('DELETE', '/api/convs/' + c.id);
+  } else console.log('- 跳过独立子文件夹测试：', WS, '没开 isolate');
+
+  // 共用目录：后来的排队，开始后也不会把前一个的文件算成自己的
+  const SHARED = process.env.WORKSPACE2 || '只读';
+  if (wsOf(SHARED) && !wsOf(SHARED).isolate) {
+    const [ca, cb] = [await conv(SHARED, 'read', '排队A'), await conv(SHARED, 'read', '排队B')];
+    const ta = await send(ca, SLOW); await untilRunning(ta.id);
+    const tb = await send(cb, '你好');
+    await sleep(1500);
+    const bMid = (await A('GET', '/api/tasks/' + tb.id)).j.task;
+    ok(bMid.status === 'queued' && bMid.waitingFor === 'workspace', '共用目录：第二个任务排队并说明原因', bMid.status);
+    await A('POST', `/api/tasks/${ta.id}/cancel`);
+    const ra = await waitTask(A, ta.id, 15000), rb = await waitTask(A, tb.id);
+    ok(rb?.status === 'done' && rb.startedAt >= ra.endedAt && noForeign(rb), '共用目录：排队任务没把前一个任务的文件算成产出', (rb?.outputs || []).map(o => o.name).join(', '));
+    for (const c of [ca, cb]) await A('DELETE', '/api/convs/' + c.id);
+  } else console.log('- 跳过共用目录排队测试：没有名为', SHARED, '的共用目录（可用 WORKSPACE2 指定）');
+}
+
+// 3c. 文件夹限制（macOS）：只读 / 可改文件级别只能访问自己的文件夹，完全放开不限制
+if (agent.confine && agent.workspaces?.find(w => w.name === WS)?.isolate) {
+  const outside = path.join(ROOT, 'README.md'); // 项目目录，不在任何用户的文件夹里
+  const probe = async (level, prompt) => {
+    const c = (await A('POST', '/api/convs', { agent: AGENT, cli: 'mock', workspace: WS, level, title: '文件夹限制' })).j.conv;
+    const r = await waitTask(A, (await A('POST', `/api/convs/${c.id}/send`, { prompt })).j.task.id);
+    await A('DELETE', '/api/convs/' + c.id);
+    return { text: (r?.events || []).filter(e => e.k === 'text').map(e => e.d).join(''), info: (r?.events || []).filter(e => e.k === 'info').map(e => e.d).join(' ') };
+  };
+  const e = await probe('edit', `读取:${outside} 写入:../../escape-${Date.now()}.txt 写入:../mine.txt 写入:./own.txt 读取:./own.txt`);
+  ok(/文件访问限制在/.test(e.info), '可改文件级别启用了文件夹限制', e.info.match(/文件访问限制在：\S+/)?.[0]);
+  ok(e.text.includes(`读取 ${outside}：失败 EPERM`) && /写入 \.\.\/\.\.\/escape-\d+\.txt：失败 EPERM/.test(e.text), '读写自己文件夹以外的文件被系统拒绝');
+  ok(e.text.includes('写入 ../mine.txt：成功') && e.text.includes('写入 ./own.txt：成功') && e.text.includes('读取 ./own.txt：成功'), '自己的文件夹（含同用户的其他对话）可以正常读写');
+  const f = await probe('full', `读取:${outside}`);
+  ok(f.text.includes(`读取 ${outside}：成功`) && !/文件访问限制在/.test(f.info), '完全放开级别不受文件夹限制');
+} else console.log('- 跳过文件夹限制测试：', agent.confine ? `${WS} 没开 isolate` : '这台设备没开文件夹限制（只支持 macOS）');
+
 // 4. 权限隔离
 const stamp = Date.now().toString(36);
 const name = 'smoke' + stamp;
