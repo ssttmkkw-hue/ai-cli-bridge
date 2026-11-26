@@ -54,6 +54,15 @@ const r1 = await waitTask(A, t1.id), r2 = await waitTask(A, t2.id);
 ok(r1?.status === 'done', '第一条完成');
 ok(r2?.status === 'done' && r2.resumeSessionId === r1.sessionId, '第二条续接了第一条的会话');
 
+// 通过网页 ID 或当前 CLI UUID 打开旧对话，查询本身不产生任务。
+const resume = (api, id) => api('POST', '/api/resume', { id });
+for (const id of [conv.id, r1.sessionId]) {
+  const { j } = await resume(A, id);
+  ok(j.conv?.id === conv.id && j.tasks?.length === 2, 'ID 查询返回原对话和两条历史消息');
+}
+ok((await resume(A, 'c_x')).status === 400, '格式错误的 ID 被拒绝');
+ok((await resume(A, 'c_000000000000')).status === 404, '未知 ID 返回未找到');
+
 // 1b. 实时推送的文本和最终保存的一致（工具调用后同一批多段文本曾被重复推送）
 {
   const ctl = new AbortController();
@@ -217,6 +226,7 @@ const stamp = Date.now().toString(36);
 const name = 'smoke' + stamp;
 await A('POST', '/api/users', { username: name, password: 'smoke123', perms: { clis: ['mock'], agents: ['*'], workspaces: [WS], maxLevel: 'read', dailyLimit: 1 } });
 const U = client(await login(name, 'smoke123'));
+ok((await resume(U, conv.id)).status === 404 && (await resume(U, r1.sessionId)).status === 404, '自己的账号只能接续自己的对话');
 ok((await U('GET', '/api/agents')).j.agentToken === undefined, '普通用户看不到 agent token');
 ok((await U('POST', '/api/convs', { agent: AGENT, cli: 'mock', workspace: WS, level: 'edit' })).status === 403, '超出权限级别被拒');
 ok((await U('GET', '/api/files/' + html.id)).status === 404, '看不到别人的文件');
