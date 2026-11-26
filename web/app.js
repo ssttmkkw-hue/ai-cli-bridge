@@ -50,6 +50,7 @@ function modelChoices(cli, agent) {
 function pillsHTML(attr, items, cur) {
   return `<div class="pills">${items.map(([v, label, disabled, note]) => `<button type="button" class="pill ${v === cur ? 'on' : ''}" data-${attr}="${esc(v)}" ${disabled ? 'disabled' : ''}><span class="tick">✓</span>${esc(label)}${note ? `<small>${esc(note)}</small>` : ''}</button>`).join('')}</div>`;
 }
+const isAdmin = () => S.me?.role === 'admin';
 const pickAgent = () => S.agents.find(a => a.online) || S.agents[0] || null;
 const deviceName = a => (!a || a.platform === 'darwin') ? 'Mac' : a.name;
 const deviceChip = a => `<span class="chip"><span class="dot ${a?.online ? 'on' : ''}"></span>${esc(deviceName(a))}${a?.online ? '' : a ? ' · 离线' : ' · 未连接'}</span>`;
@@ -64,7 +65,7 @@ async function afterLogin() {
   connectStream();
   await Promise.all([loadAgents(), loadConvs()]);
   S.loaded = true; // 加载完之前不显示「未连接」「还没有对话」这类状态，免得一闪而过
-  setTimeout(() => refreshQuota(true), 500); // 右上角的额度圆环：登录后先查一次（数据够新就直接用）
+  if (isAdmin()) setTimeout(() => refreshQuota(true), 500); // 右上角的额度圆环：登录后先查一次（数据够新就直接用）
   // 手机上一打开先看历史对话
   if (!S.conv && matchMedia('(max-width:760px)').matches) S.sideOpen = true;
   render();
@@ -113,22 +114,23 @@ function onChunk({ taskId, events }) {
 function render() {
   const app = $('#app');
   if (!S.me) { app.innerHTML = loginHTML(); bindLogin(); return; }
-  const isAdmin = S.me.role === 'admin';
-  const tabs = [['chat', '对话'], ['tasks', '任务'], ['agents', '设备'], ...(isAdmin ? [['users', '用户权限']] : [])];
+  const admin = isAdmin();
+  if (!admin) S.view = 'chat'; // 非管理员只有对话页
+  const tabs = admin ? [['chat', '对话'], ['tasks', '任务'], ['agents', '设备'], ['users', '用户权限']] : [];
   app.innerHTML = `
     <header class="top">
       <div class="brand"><i>&gt;_</i><span>AI 遥控台</span></div>
-      <nav class="nav">${tabs.map(([k, n]) => `<button data-v="${k}" class="${S.view === k ? 'on' : ''}">${n}</button>`).join('')}</nav>
+      <nav class="nav">${tabs.map(([k, n]) => `<button data-v="${k}" class="${S.view === k ? 'on' : ''}">${n}</button>`).join('')}</nav>${admin ? '' : '<span style="flex:1"></span>'}
       <div class="me"><span class="dot" id="headDot"></span><span class="name">${esc(S.me.username)}</span>
-        <button class="icon-btn qbtn" id="quotaBtn" title="额度使用情况（也可以在对话里发 /usage）">${quotaRingSVG()}</button><button class="icon-btn" id="prefBtn" title="偏好设置">⚙</button><button class="icon-btn" id="pwBtn" title="改密码">🔑</button><button class="icon-btn" id="logout" title="退出">⏻</button></div>
+        ${admin ? `<button class="icon-btn qbtn" id="quotaBtn" title="额度使用情况（也可以在对话里发 /usage）">${quotaRingSVG()}</button>` : ''}<button class="icon-btn" id="prefBtn" title="偏好设置">⚙</button>${S.me.env ? '' : '<button class="icon-btn" id="pwBtn" title="改密码">🔑</button>'}<button class="icon-btn" id="logout" title="退出">⏻</button></div>
     </header>
     <div class="quota-pop card" id="quotaPop" ${S.quotaOpen ? '' : 'hidden'}></div>
     <div class="main" id="main"></div>`;
   app.querySelectorAll('.nav button').forEach(b => b.onclick = () => { S.view = b.dataset.v; S.sideOpen = false; location.hash = S.view; render(); });
   $('#logout').onclick = async () => { await api('POST', '/api/logout'); S.es?.close(); S.me = null; render(); };
-  $('#pwBtn').onclick = changePassword;
+  if ($('#pwBtn')) $('#pwBtn').onclick = changePassword;
   $('#prefBtn').onclick = prefsDialog;
-  $('#quotaBtn').onclick = () => setQuotaOpen(!S.quotaOpen);
+  if ($('#quotaBtn')) $('#quotaBtn').onclick = () => setQuotaOpen(!S.quotaOpen);
   if (S.quotaOpen) renderQuota();
   updateHeadAgent();
   renderView();
@@ -199,7 +201,7 @@ function setQuotaOpen(open) {
   if (open) { renderQuota(); const q = pickAgent()?.quota; if (!q || Date.now() - (q.at || 0) > 60000) refreshQuota(); } // 超过 1 分钟的数据自动刷新
 }
 const QUOTA_EVERY = 5 * 60000;
-setInterval(() => { if (S.me && S.loaded && document.visibilityState === 'visible') refreshQuota(true); }, QUOTA_EVERY);
+setInterval(() => { if (isAdmin() && S.loaded && document.visibilityState === 'visible') refreshQuota(true); }, QUOTA_EVERY);
 document.addEventListener('visibilitychange', () => {
   const q = pickAgent()?.quota;
   if (S.me && S.loaded && document.visibilityState === 'visible' && Date.now() - (q?.at || 0) > QUOTA_EVERY) refreshQuota(true);
@@ -221,27 +223,48 @@ function updateHeadAgent() {
 }
 function renderView() {
   const m = $('#main'); if (!m) return;
+  if (!isAdmin()) S.view = 'chat';
   ({ chat: viewChat, tasks: viewTasks, agents: viewAgents, users: viewUsers }[S.view] || viewChat)(m);
 }
 
 // ============================================================ 登录
+const EYE_OPEN = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18M10.6 5.1A10.7 10.7 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4M6.6 6.6C3.8 8.3 2 12 2 12s3.6 7 10 7a9.8 9.8 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>';
 function loginHTML() {
-  return `<form class="card login" id="loginForm">
-    <h1 style="margin-bottom:20px">AI 遥控台</h1>
-    <label class="field"><span>用户名</span><input class="input" name="username" autocomplete="username" required></label>
-    <label class="field"><span>密码</span><input class="input" name="password" type="password" autocomplete="current-password" required></label>
-    <div class="err" id="loginErr"></div>
-    <button class="btn primary" style="width:100%;justify-content:center">登录</button></form>`;
+  return `<div class="login-page"><form class="login-card" id="loginForm">
+    <div class="login-mark"><svg viewBox="0 0 32 32" width="26" height="26" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 11l5 5-5 5M16 21h8"/></svg></div>
+    <h1>AI 遥控台</h1>
+    <label class="field"><span>用户名</span><input class="input" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+    <label class="field"><span>密码</span><span class="pw-wrap"><input class="input" name="password" type="password" autocomplete="current-password" required>
+      <button type="button" class="pw-eye" id="pwEye" aria-label="显示密码" title="显示密码">${EYE_OPEN}</button></span></label>
+    <div class="login-err" id="loginErr" role="alert"></div>
+    <button class="btn primary login-btn" id="loginBtn">登录</button>
+  </form></div>`;
 }
 function bindLogin() {
-  $('#loginForm').onsubmit = async e => {
+  const form = $('#loginForm'), pw = form.password, btn = $('#loginBtn'), err = $('#loginErr');
+  form.username.focus();
+  $('#pwEye').onclick = () => {
+    const show = pw.type === 'password'; pw.type = show ? 'text' : 'password';
+    $('#pwEye').innerHTML = show ? EYE_OFF : EYE_OPEN; $('#pwEye').title = $('#pwEye').ariaLabel = show ? '隐藏密码' : '显示密码';
+    pw.focus();
+  };
+  form.oninput = () => { err.textContent = ''; };
+  form.onsubmit = async e => {
     e.preventDefault();
-    const f = new FormData(e.target);
-    try { const r = await api('POST', '/api/login', { username: f.get('username'), password: f.get('password') }); S.me = r.user; render(); afterLogin(); }
-    catch (err) { $('#loginErr').textContent = err.message; }
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 登录中…'; err.textContent = '';
+    try {
+      const r = await api('POST', '/api/login', { username: form.username.value.trim(), password: pw.value });
+      S.me = r.user; render(); afterLogin();
+    } catch (e2) {
+      err.textContent = e2.message; btn.disabled = false; btn.textContent = '登录';
+      form.classList.remove('shake'); void form.offsetWidth; form.classList.add('shake'); // 密码错了晃一下
+      pw.select();
+    }
   };
 }
 function changePassword() {
+  if (S.me?.env) return toast('这个账号的密码由部署平台的环境变量设置，请到那里修改', true);
   modal(`<h3>修改密码</h3>
     <label class="field"><span>原密码</span><input class="input" type="password" id="pwOld"></label>
     <label class="field"><span>新密码（至少 6 位）</span><input class="input" type="password" id="pwNew"></label>`,
@@ -329,7 +352,11 @@ function renderNewChat() {
   const a = pickAgent(), d = draftChoice(a);
   el.innerHTML = `<div class="newchat-inner">
     ${deviceChip(a)}
-    ${pillsHTML('cli', CLI_CHOICES.map(k => { const c = a?.clis?.[k]; return [k, CLI_NAME[k], !c?.ok, !c ? '不可用' : c.ok ? '' : '未安装']; }), d.cli)}
+    ${(() => {
+      const list = CLI_CHOICES.filter(k => isAdmin() || a?.clis?.[k]?.ok); // 中继已经按权限筛过 clis
+      if (!isAdmin() && list.length <= 1) return '';
+      return pillsHTML('cli', list.map(k => { const c = a?.clis?.[k]; return [k, CLI_NAME[k], !c?.ok, !c ? '不可用' : c.ok ? '' : '未安装']; }), d.cli);
+    })()}
     ${pillsHTML('model', modelChoices(d.cli, a), d.model ?? '')}
   </div>`;
   el.querySelectorAll('[data-cli]').forEach(b => b.onclick = () => { S.draft = { cli: b.dataset.cli, model: null }; renderNewChat(); });
@@ -528,11 +555,11 @@ function renderTurn(id, streaming) {
         ${t.status === 'queued' && t.waitingFor === 'workspace' ? `<span class="faint">「${esc(t.workspace)}」目录里有别的任务在跑，等它结束后自动开始</span>` : ''}
         ${active ? `<button class="btn sm danger" data-cancel="${t.id}" ${t.cancelRequested ? 'disabled' : ''}>${t.cancelRequested ? '停止中…' : '停止'}</button>` : ''}
         ${['failed', 'cancelled'].includes(t.status) ? `<button class="btn sm" data-retry="${t.id}">重试</button>` : ''}</div>
-      ${eventsHTML(t.events || [], t.linkMap)}
+      ${eventsHTML(t.events || [], t.linkMap, false, !isAdmin())}
       ${t.status === 'done' && !hasText && t.result ? `<div class="md">${md(t.result, t.linkMap)}</div>` : ''}
       ${outputsHTML(t)}
       ${t.error && t.status !== 'cancelled' ? `<div class="errbox">${esc(t.error)}</div>` : ''}
-      ${t.endedAt ? `<div class="usage">${esc(usageText(t))}</div>` : ''}
+      ${t.endedAt && isAdmin() ? `<div class="usage">${esc(usageText(t))}</div>` : ''}
     </div>`;
   el.querySelector('[data-cancel]')?.addEventListener('click', e => stopTask(id, e.currentTarget));
   el.querySelector('[data-retry]')?.addEventListener('click', async () => { const r = await tryApi('POST', `/api/tasks/${id}/retry`); S.tasks.set(r.task.id, { ...r.task, events: [] }); renderTurn(r.task.id); scrollBottom(true); });
@@ -688,7 +715,7 @@ const listText = l => !l || l.includes('*') ? '全部' : l.length ? l.join('、'
 function renderUsers() {
   const tb = $('#userTable'); if (!tb) return;
   tb.innerHTML = `<tr><th>用户</th><th>角色</th><th class="hide-m">CLI</th><th class="hide-m">设备 / 目录</th><th>最高权限</th><th>今日 / 额度</th><th></th></tr>` + S.users.map(u => `
-    <tr><td><b>${esc(u.username)}</b>${u.disabled ? ' <span class="chip failed">已停用</span>' : ''}</td>
+    <tr><td><b>${esc(u.username)}</b>${u.env ? ` <span class="chip" title="密码由部署平台的环境变量 ${esc(u.env === 'ADMIN' ? 'ADMIN_PASSWORD' : u.env + '_PASSWORD')} 设置">环境变量</span>` : ''}${u.disabled ? ' <span class="chip failed">已停用</span>' : ''}</td>
       <td>${u.role === 'admin' ? '<span class="chip running">管理员</span>' : '<span class="chip">成员</span>'}</td>
       <td class="hide-m">${esc(listText(u.perms.clis))}</td>
       <td class="hide-m">${esc(listText(u.perms.agents))}<div class="faint">${esc(listText(u.perms.workspaces))}</div></td>
@@ -707,7 +734,8 @@ function userDialog(u) {
     ${all.map(v => `<label><input type="checkbox" data-g="${name}" value="${esc(v)}" ${cur.includes(v) || cur.includes('*') ? 'checked' : ''}>${esc(CLI_NAME[v] || v)}</label>`).join('')}</div>`;
   const m = modal(`<h3>${isNew ? '添加用户' : '编辑用户：' + esc(u.username)}</h3>
     ${isNew ? '<label class="field"><span>用户名</span><input class="input" id="uName"></label>' : ''}
-    <label class="field"><span>${isNew ? '密码（至少 6 位）' : '重置密码（留空不改）'}</span><input class="input" id="uPw" type="text" autocomplete="off"></label>
+    ${u?.env ? `<div class="field"><span>密码</span><div class="muted" style="font-size:14px">由部署平台的环境变量 <code>${esc(u.env === 'ADMIN' ? 'ADMIN_PASSWORD' : u.env + '_PASSWORD')}</code> 设置，在这里改不了</div></div>`
+      : `<label class="field"><span>${isNew ? '密码（至少 6 位）' : '重置密码（留空不改）'}</span><input class="input" id="uPw" type="text" autocomplete="off"></label>`}
     <label class="field"><span>角色</span><select class="input" id="uRole"><option value="user">成员</option><option value="admin" ${u?.role === 'admin' ? 'selected' : ''}>管理员（可管理用户、看所有任务）</option></select></label>
     <div class="field"><span>可用的 CLI</span>${checks('clis', allClis, p.clis)}</div>
     <div class="field"><span>可用的设备</span>${checks('agents', allAgents, p.agents)}</div>
@@ -715,12 +743,12 @@ function userDialog(u) {
     <div class="field"><span>最高权限级别</span><select class="input" id="uLv">${LVORDER.map(k => `<option value="${k}" ${p.maxLevel === k ? 'selected' : ''}>${LV[k].name} — ${LV[k].desc}</option>`).join('')}</select></div>
     <label class="field"><span>每日次数上限（0 = 不限）</span><input class="input" id="uLim" type="number" min="0" value="${p.dailyLimit || 0}"></label>
     ${isNew ? '' : `<label class="checks" style="margin-bottom:12px"><label><input type="checkbox" id="uDis" ${u.disabled ? 'checked' : ''}>停用这个账号</label></label>
-      <button class="btn danger sm" id="uDel">删除用户</button>`}`,
+      ${u.env ? '' : '<button class="btn danger sm" id="uDel">删除用户</button>'}`}`,
   async () => {
     const grp = n => { const vals = [...m.querySelectorAll(`[data-g=${n}]:checked`)].map(x => x.value); return vals.includes('*') ? ['*'] : vals; };
     const perms = { clis: grp('clis'), agents: grp('agents'), workspaces: grp('workspaces'), maxLevel: $('#uLv').value, dailyLimit: +$('#uLim').value };
     const body = { role: $('#uRole').value, perms };
-    if ($('#uPw').value) body.password = $('#uPw').value;
+    if ($('#uPw')?.value) body.password = $('#uPw').value;
     if (isNew) { body.username = $('#uName').value; await tryApi('POST', '/api/users', body); }
     else { body.disabled = $('#uDis').checked; await tryApi('PUT', '/api/users/' + u.id, body); }
     toast('已保存'); viewUsers($('#main'));
@@ -738,6 +766,6 @@ function userDialog(u) {
 
 window.addEventListener('hashchange', () => {
   const h = location.hash.slice(1);
-  if (S.me && h !== S.view && ['chat', 'tasks', 'agents', 'users'].includes(h)) { S.view = h; render(); }
+  if (S.me && isAdmin() && h !== S.view && ['chat', 'tasks', 'agents', 'users'].includes(h)) { S.view = h; render(); }
 });
 boot();

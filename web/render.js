@@ -137,7 +137,8 @@ function inputsHTML(t) {
 
 // 开发用的提示：新记录带 dev: true；旧记录没有这个标记，按内容认出来
 const isDevInfo = e => e.k === 'info' && (e.dev || /^模型 .* · 目录 /.test(e.d) || /^文件访问限制在：/.test(e.d));
-function eventsHTML(events, linkMap, showDev = false) {
+// simple = true（非管理员）：只显示回答正文和错误，不显示工具步骤（含 Mac 上的路径、命令）和技术提示
+function eventsHTML(events, linkMap, showDev = false, simple = false) {
   let html = '', tools = [], lastInfo = null; // lastInfo：连续重复的提示只显示一条
   const flushTools = () => {
     if (!tools.length) return;
@@ -146,6 +147,7 @@ function eventsHTML(events, linkMap, showDev = false) {
     tools = [];
   };
   for (const e of events) {
+    if (simple && e.k !== 'text' && e.k !== 'err') continue;
     if (e.k === 'tool') tools.push(`<div class="tool"><b>${esc(e.name)}</b> ${esc(e.d)}</div>`);
     else if (e.k === 'tool_out') { if (e.d) tools.push(`<div class="tool-out ${e.err ? 'err' : ''}">${esc(e.d)}</div>`); }
     else if (e.k === 'think') { flushTools(); html += `<details class="fold"><summary>思考过程</summary><div class="info">${esc(e.d)}</div></details>`; }

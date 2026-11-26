@@ -30,7 +30,7 @@ agent 是**主动连出去**领任务的，所以 Mac 放在家里路由器后�
 | `mac/install-mac.sh` | 在 Mac 上装成开机自启服务（launchd） |
 | `scripts/start-local.js` | 本地联调：一条命令同时起中继 + agent |
 | `scripts/mock-cli.js` | 假 CLI，不花额度测试整条链路 |
-| `dev/smoke-test.mjs` | 冒烟测试（39 项，只用假 CLI） |
+| `dev/smoke-test.mjs` | 冒烟测试（41 项，只用假 CLI） |
 | `docs/DEVELOPMENT.md` | 开发交接：代码地图、已知问题、下一步计划、Mac 验证清单 |
 | `data/` | 运行后生成：`config.json`（agent token）、`users.json`、`db.json`、`sessions.json`（登录会话）、`files/`（产出与附件）、`INITIAL_ADMIN.txt` |
 
@@ -42,7 +42,7 @@ npm run local        # 等同于 node scripts/start-local.js 5227
 
 打开 http://localhost:5227 ，管理员账号 `admin`，初始密码在 `data/INITIAL_ADMIN.txt`。
 本地联调会自动生成 `agent/agent.local.json`，带一个「模拟 CLI」和两个测试目录（`test-workspaces/sandbox` 可写、`test-workspaces/readonly` 只读）。
-另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 39 项功能，不花额度。
+另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 41 项功能，不花额度。
 
 ## 二、部署到 Mac Air
 
@@ -96,7 +96,10 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 | `RELAY_DATA` | 数据目录（默认 `data/`），挂了持久磁盘就指过去 |
 | `TRUST_PROXY` | 前面有几层反向代理（Render 是 1）。不设时完全不看 `X-Forwarded-For`，防止伪造 IP 绕过登录限流 |
 | `AGENT_TOKEN` | 固定 agent token（至少 24 位）；不设则自动生成并存在 `data/config.json` |
-| `ADMIN_PASSWORD` | 没有任何账号时用它创建管理员 `admin`（至少 8 位）；不设则随机生成并写进 `data/INITIAL_ADMIN.txt` |
+| `ADMIN_PASSWORD` | 管理员 `admin` 的密码（至少 8 位），每次启动都以它为准；不设则第一次启动时随机生成并写进 `data/INITIAL_ADMIN.txt` |
+| `GUEST1_PASSWORD` … `GUEST5_PASSWORD` | 最多 5 个访客账号的密码（至少 8 位），设了哪个就有哪个账号，删掉就停用；改了密码，已登录的设备会被踢下线 |
+| `GUEST1_NAME` … `GUEST5_NAME` | 可选，访客的用户名（默认 `guest1` … `guest5`，可以用中文） |
+| `GUEST_MAX_LEVEL` / `GUEST_DAILY_LIMIT` | 可选，访客新建时的最高权限（默认 `edit` 可改文件）和每日条数（默认 50） |
 
 #### 部署到 Render（仓库里有 `render.yaml`）
 
@@ -104,6 +107,8 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 2. 按 `render.yaml` 创建：新加坡机房、免费版、`node relay/server.js`。创建时会让你填 `ADMIN_PASSWORD`；`AGENT_TOKEN` 自动生成，在服务的 Environment 页能看到。
 3. 部署完成后打开 `https://<服务名>.onrender.com`，用 `admin` + 你填的密码登录。
 4. Mac 上 `agent/agent.config.json` 的 `relayUrl` 改成这个网址，`token` 填 `AGENT_TOKEN`，然后 `npm run agent`（或 `bash mac/install-mac.sh agent` 装成开机自启）。
+
+加访客账号：服务的 **Environment** 页点 Add，加 `GUEST1_PASSWORD`（需要的话再加 `GUEST1_NAME`），保存后服务会自动重启。环境变量管理的账号在网页上改不了密码、也删不掉，「用户权限」页会标出「环境变量」。
 
 免费版的限制：磁盘不持久，**每次重启 / 重新部署后对话、上传的文件和你新建的账号都会清空**（管理员密码和 agent token 因为来自环境变量，保持不变，Mac 会自动重连）；一段时间没有请求会休眠，唤醒要几十秒（agent 一直在轮询，通常能保持唤醒）。长期使用请换付费实例并挂持久磁盘，把 `RELAY_DATA` 指到磁盘路径。
 
@@ -114,6 +119,8 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 - 最高权限级别：只读问答 / 可改文件 / 完全放开
 - 每日次数上限；可停用账号
 - 管理员能看所有人的任务；普通用户只能看自己的
+
+**管理员和其他账号看到的不一样**：只有管理员有「任务 / 设备 / 用户权限」页、右上角的额度圆环、回答里的工具步骤（含 Mac 上的路径和命令）、技术提示和耗时费用；其他账号只看到对话、模型选择、回答正文和产出文件（只能用一种 CLI 时连 CLI 选择都不显示）。中继发给非管理员的设备信息里也去掉了额度、电脑名等。
 
 **设备层面**（Mac 上的 `agent.config.json`，网页改不了）：
 - 只有配置里列出的 `workspaces` 能被使用，网页只传目录**名字**，不能传任意路径

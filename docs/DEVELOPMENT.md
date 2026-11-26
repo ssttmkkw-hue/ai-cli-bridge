@@ -8,7 +8,7 @@
 - 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
 - Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
 - Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
-- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 39 项，全部通过。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 41 项，全部通过。
 
 ## 架构
 
@@ -34,7 +34,8 @@
 | 停止 | `cancelRequested` + `cancelSentAt`（指令只发一次，10 秒后补发一次）；30 秒还没停，中继直接判为已取消 |
 | 掉线 | 执行端 45 秒没轮询即视为离线；已派发的任务 90 秒没有回音就判失败；中继重启时正在跑的任务判失败 |
 | 文件 | `POST /api/agent/files`（agent 上传产出）、`GET /api/agent/files/:id`（agent 取附件）、`POST /api/uploads`（用户上传，需要 `X-Upload: 1` 头防 CSRF）、`GET /api/files/:id`（只有能看到这个任务的人能访问；HTML/SVG 带 `CSP: sandbox`） |
-| 推送 | `/api/stream` SSE，事件 `task`（任务摘要，不含 events）、`chunk`（新增输出）、`agents`（设备列表） |
+| 环境变量账号 | 启动时 `syncEnvAccounts()`：`ADMIN_PASSWORD`、`GUEST1..5_PASSWORD`（`GUESTn_NAME` 改名）。账号带 `env` 标记（`ADMIN` / `GUESTn`），密码以环境变量为准（变了就 `kickUser()` 踢下线），环境变量没了就停用；这些账号在网页上不能改密码、不能删。访客默认权限 `GUEST_PERMS()`（只能用 Claude、最高 edit、每天 50 条） |
+| 推送 | `/api/stream` SSE，事件 `task`（任务摘要，不含 events）、`chunk`（新增输出）、`agents`（设备列表，按接收者权限用 `visibleAgents()` 筛过：非管理员没有额度、电脑名、并发等） |
 | 订阅额度 | agent 每个记录挂 `quota`（最近一次）和 `probes`（待执行的即时查询）。`POST /api/quota` → `requestProbe()` 把 `{kind:"usage"}` 塞进长轮询的返回值（`probes`），最多等 45 秒；带 `maxAge`（网页每 5 分钟的自动查询传 4 分钟）时数据够新直接返回缓存；同一时间只跑一次（`a.probing`），并发的请求共用结果；agent 跑完 `POST /api/agent/quota` 带 `probeId` 回来。agent 平时在任务输出里看到 `rate_limit_event` 也会上报（20 秒最多一次）。`sanitizeQuota()` 只留 `key/label/percent/resetsAt/resetsText/status` |
 | 备份导出 | `GET /api/convs/:id/export`、`GET /api/export`（`?all=1` 管理员导出所有人）→ `relay/export.js` 的 `exportConvs()`：先 `plan()` 决定每个文件在 zip 里的位置（同一任务同一路径只打包一份；回答里的「引用」不算新版本；最终版放 `files/`，被后面改掉的放 `history/t<N>/`），再用 `relay/zip.js` 的 `ZipWriter` 边读边写进响应（一次只读一个文件；文件名 UTF-8 标记 + 0x7075 扩展字段；我们自己起的目录名只用英文）。`index.html` 把 `style.css`、`render.js`、`export-viewer.js` 和数据内嵌进去 |
 
@@ -76,7 +77,8 @@
 
 ```bash
 npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
-node dev/smoke-test.mjs  # 另开终端，39 项冒烟测试，不花额度
+node dev/smoke-test.mjs  # 另开终端，41 项冒烟测试，不花额度
+node dev/env-accounts-test.mjs  # 环境变量账号（ADMIN_PASSWORD / GUESTn），自己起临时中继，不用先启动服务
 npm run check            # 只做语法检查
 ```
 
@@ -111,7 +113,7 @@ npm run check            # 只做语法检查
 - [ ] `brew install node`，`node -v` ≥ 18
 - [ ] `claude` 登录；`codex login`
 - [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
-- [ ] `node dev/smoke-test.mjs` 39 项全过
+- [ ] `node dev/smoke-test.mjs` 41 项全过
 - [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
 - [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
 - [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览

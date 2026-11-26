@@ -221,6 +221,19 @@ ok((await U('GET', '/api/agents')).j.agentToken === undefined, '普通用户看�
 ok((await U('POST', '/api/convs', { agent: AGENT, cli: 'mock', workspace: WS, level: 'edit' })).status === 403, '超出权限级别被拒');
 ok((await U('GET', '/api/files/' + html.id)).status === 404, '看不到别人的文件');
 ok((await U('GET', '/api/users')).status === 403, '普通用户不能管理用户');
+ok((await U('GET', '/api/quota')).status === 403 && (await U('POST', '/api/quota', { agent: AGENT })).status === 403, '普通用户看不到额度（那是管理员的 Claude 账号）');
+{
+  const ua = (await U('GET', '/api/agents')).j.agents?.find(a => a.name === AGENT) || {};
+  // 实时推送里的设备信息也要按权限筛过
+  const ctl = new AbortController();
+  const sr = await fetch(B + '/api/stream', { headers: { cookie: await login(name, 'smoke123') }, signal: ctl.signal });
+  let buf = ''; const dec = new TextDecoder();
+  for await (const part of sr.body) { buf += dec.decode(part, { stream: true }); if (buf.includes('event: agents\ndata: ') && buf.split('event: agents\ndata: ')[1].includes('\n')) break; }
+  ctl.abort();
+  const sa = JSON.parse(buf.split('event: agents\ndata: ')[1].split('\n')[0]).find(a => a.name === AGENT) || {};
+  const clean = x => !('quota' in x) && !('hostname' in x) && Object.keys(x.clis || {}).join() === 'mock';
+  ok(clean(ua) && clean(sa), '普通用户拿到的设备信息（接口和实时推送）不含额度、电脑名，只有自己能用的 CLI', Object.keys(ua.clis || {}).join());
+}
 const uc = (await U('POST', '/api/convs', { agent: AGENT, cli: 'mock', workspace: WS, level: 'read' })).j.conv;
 await U('POST', `/api/convs/${uc.id}/send`, { prompt: 'a' });
 ok((await U('POST', `/api/convs/${uc.id}/send`, { prompt: 'b' })).status === 429, '每日额度生效');

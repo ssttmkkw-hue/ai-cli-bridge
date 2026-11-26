@@ -140,7 +140,7 @@ if (!users.length) {
 }
 
 function publicUser(u) {
-  return { id: u.id, username: u.username, role: u.role, disabled: !!u.disabled, perms: u.perms, createdAt: u.createdAt };
+  return { id: u.id, username: u.username, role: u.role, disabled: !!u.disabled, perms: u.perms, createdAt: u.createdAt, env: u.env || null };
 }
 const allow = (list, v) => !list || list.includes('*') || list.includes(v);
 function levelAllowed(user, level) {
@@ -167,6 +167,54 @@ setInterval(() => {
   const obj = {}; for (const [h, v] of Map.prototype.entries.call(sessions)) if (v.exp > Date.now()) obj[h] = v;
   writeJSONAtomic(SESS_FILE, obj);
 }, 2000);
+
+// ---------------------------------------------------------------- 环境变量管理的账号（admin + 最多 5 个 guest）
+// 部署平台（Render 等）上设置：ADMIN_PASSWORD；GUEST1_PASSWORD … GUEST5_PASSWORD（可选 GUEST1_NAME … 改用户名，默认 guest1 …）。
+// 每次启动都按环境变量同步：密码以环境变量为准（变了就更新，并让已登录的设备下线）；删掉某个 GUESTn_PASSWORD，对应账号停用。
+// 这些账号的密码不能在网页上改、也不能删（会和环境变量打架），权限可以在「用户权限」页调整。
+const GUEST_PERMS = () => ({
+  clis: ['claude'], agents: ['*'], workspaces: ['*'],
+  maxLevel: LEVELS.includes(process.env.GUEST_MAX_LEVEL) ? process.env.GUEST_MAX_LEVEL : 'edit', // 默认不给「完全放开」
+  dailyLimit: Math.max(0, Number(process.env.GUEST_DAILY_LIMIT ?? 50) || 0),
+});
+function kickUser(id) { for (const [k, s] of sessions) if (s.userId === id) sessions.delete(k); }
+function syncEnvAccounts() {
+  let changed = false;
+  const setPw = (u, pw) => { if (checkPassword(u, pw)) return false; Object.assign(u, hashPassword(pw)); kickUser(u.id); changed = true; return true; };
+  const adminPw = process.env.ADMIN_PASSWORD || '';
+  if (adminPw) {
+    const a = users.find(u => u.env === 'ADMIN') || users.find(u => u.username === 'admin' && u.role === 'admin');
+    if (a) {
+      if (a.env !== 'ADMIN' || a.disabled) { a.env = 'ADMIN'; a.disabled = false; changed = true; }
+      if (setPw(a, adminPw)) console.log('[relay] 管理员 admin 的密码已按环境变量更新');
+    }
+  }
+  for (let n = 1; n <= 5; n++) {
+    const tag = 'GUEST' + n, pw = process.env[tag + '_PASSWORD'] || '';
+    const name = String(process.env[tag + '_NAME'] || 'guest' + n).trim();
+    let u = users.find(x => x.env === tag);
+    if (!pw) {
+      if (u && !u.disabled) { u.disabled = true; kickUser(u.id); changed = true; console.log(`[relay] 没有设置 ${tag}_PASSWORD，账号 ${u.username} 已停用`); }
+      continue;
+    }
+    if (pw.length < 8) { console.error(`[relay] 环境变量 ${tag}_PASSWORD 太短（至少 8 位），跳过这个账号`); continue; }
+    if (!/^[\w一-龥.-]{2,24}$/.test(name)) { console.error(`[relay] ${tag}_NAME「${name}」不合法（2-24 位字母、数字、中文），跳过这个账号`); continue; }
+    const clash = users.find(x => x.username === name && x !== u);
+    if (clash) {
+      if (!u && !clash.env) { u = clash; u.env = tag; changed = true; } // 网页上建过同名账号：接管它
+      else { console.error(`[relay] ${tag}_NAME「${name}」和已有账号重名，跳过这个账号`); continue; }
+    }
+    if (!u) {
+      users.push({ id: newId('u'), username: name, role: 'user', disabled: false, createdAt: Date.now(), env: tag, perms: GUEST_PERMS(), ...hashPassword(pw) });
+      changed = true; console.log(`[relay] 已按环境变量创建账号 ${name}`);
+      continue;
+    }
+    if (u.username !== name || u.disabled) { u.username = name; u.disabled = false; changed = true; }
+    if (setPw(u, pw)) console.log(`[relay] 账号 ${name} 的密码已按环境变量更新`);
+  }
+  if (changed) writeJSONAtomic(files.users, users);
+}
+syncEnvAccounts();
 function parseCookies(req) {
   const out = {};
   for (const part of (req.headers.cookie || '').split(';')) {
@@ -218,7 +266,8 @@ function push(event, data, filter) {
   }
 }
 function pushTask(t) { push('task', taskSummary(t), u => canSeeTask(u, t)); }
-function pushAgents() { push('agents', [...agents.values()].map(publicAgent)); }
+// 每个人只收到按自己权限筛过的设备信息（非管理员看不到额度、电脑名等，也看不到没权限的设备 / 目录 / CLI）
+function pushAgents() { for (const s of streams) s.res.write(`event: agents\ndata: ${JSON.stringify(visibleAgents(s.user))}\n\n`); }
 setInterval(() => { for (const s of streams) s.res.write(': ping\n\n'); }, 20000);
 
 // 在线状态变化检测
@@ -526,6 +575,7 @@ async function handle(req, res) {
   if (p === '/api/me' && m === 'GET') return send(res, 200, { user: publicUser(user), today: tasksToday(user.id) });
   if (p === '/api/me/password' && m === 'POST') {
     const b = await readBody(req);
+    if (user.env) fail(400, '这个账号的密码由部署平台的环境变量设置，请到那里修改');
     if (!checkPassword(user, b.old || '')) fail(400, '原密码不对');
     if (String(b.password || '').length < 6) fail(400, '新密码至少 6 位');
     Object.assign(user, hashPassword(b.password)); usersDirty = true;
@@ -698,6 +748,7 @@ async function handle(req, res) {
 
   // 订阅额度：GET 拿最近一次的；POST 让 Mac 立刻查一次（相当于在 Mac 上运行 /usage）
   if (p === '/api/quota') {
+    if (!isAdmin) fail(403, '只有管理员能看额度');
     const body = m === 'POST' ? await readBody(req) : {};
     const name = url.searchParams.get('agent') || body.agent || null;
     const list = visibleAgents(user);
@@ -748,12 +799,17 @@ async function handle(req, res) {
         if (b.role) u.role = b.role === 'admin' ? 'admin' : 'user';
         if (typeof b.disabled === 'boolean') u.disabled = b.disabled;
         if (b.perms) u.perms = sanitizePerms(b.perms);
-        if (b.password) { if (String(b.password).length < 6) fail(400, '密码至少 6 位'); Object.assign(u, hashPassword(b.password)); }
+        if (b.password) {
+          if (u.env) fail(400, '这个账号的密码由部署平台的环境变量设置，请到那里修改');
+          if (String(b.password).length < 6) fail(400, '密码至少 6 位');
+          Object.assign(u, hashPassword(b.password));
+        }
         if (u.disabled) for (const [k, s] of sessions) if (s.userId === u.id) sessions.delete(k);
         usersDirty = true; return send(res, 200, { user: publicUser(u) });
       }
       if (m === 'DELETE') {
         if (u.id === user.id) fail(400, '不能删除自己');
+        if (u.env) fail(400, '这个账号由环境变量管理：删掉部署平台上的对应环境变量，重启后就会停用');
         users = users.filter(x => x !== u); usersDirty = true;
         for (const [k, s] of sessions) if (s.userId === u.id) sessions.delete(k);
         return send(res, 200, { ok: true });
@@ -777,6 +833,8 @@ function visibleAgents(user) {
     if (user.role !== 'admin') {
       pa.workspaces = pa.workspaces.filter(w => allow(user.perms.workspaces, w.name));
       pa.clis = Object.fromEntries(Object.entries(pa.clis).filter(([k]) => allow(user.perms.clis, k)));
+      // 非管理员不需要知道这些：订阅额度（是管理员的 Claude 账号）、电脑名、并发、正在跑的任务、文件夹限制开关
+      delete pa.quota; delete pa.hostname; delete pa.running; delete pa.maxConcurrent; delete pa.confine; delete pa.version;
     }
     return pa;
   });
