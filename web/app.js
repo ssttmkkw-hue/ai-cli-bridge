@@ -810,6 +810,13 @@ function userDialog(u) {
   });
 }
 
+// 手机 / 平板上点备份：先提示要在电脑上看（解压后的 index.html 在手机上不运行脚本，对话显示不出来）
+document.addEventListener('click', e => {
+  const a = e.target.closest?.('a[href^="/api/export"], a[href$="/export"]');
+  if (!a || !matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+  if (!confirm('备份需要在电脑上查看：解压后双击 index.html。\n手机上解压后打不开，可以先下载保存，之后传到电脑上看。\n\n继续下载？')) e.preventDefault();
+});
+
 window.addEventListener('hashchange', () => {
   const h = location.hash.slice(1);
   if (S.me && isAdmin() && h !== S.view && ['chat', 'tasks', 'agents', 'users'].includes(h)) { S.view = h; render(); }

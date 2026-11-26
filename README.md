@@ -183,7 +183,7 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 
 Render 免费版重启 / 重新部署会清空对话记录，重要的对话记得先备份。
 
-备份 zip 适合在电脑上看：手机和平板解压后打开 index.html 时脚本不运行（iOS 文件 App 只做静态预览），对话显示不出来。
+备份 zip 适合在电脑上看：手机和平板解压后打开 index.html 时脚本不运行（iOS 文件 App 只做静态预览），对话显示不出来。所以在手机和平板上点备份时会先弹出提示，确认后仍可下载保存，之后传到电脑上看。
 
 ## 五、文件与图片
 
