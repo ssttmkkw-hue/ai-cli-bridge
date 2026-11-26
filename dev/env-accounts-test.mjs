@@ -32,12 +32,18 @@ const call = async (ck, m, u, b) => {
 
 try {
   // ---- 第一次启动
-  let r = await relay({ ADMIN_PASSWORD: 'admin-pass-1', GUEST1_PASSWORD: 'guest1-pass-1', GUEST2_PASSWORD: 'guest2-pass-1', GUEST2_NAME: '妈妈', GUEST3_PASSWORD: 'short' });
+  let r = await relay({ ADMIN_PASSWORD: 'admin-pass-1', GUEST1_PASSWORD: 'guest1-pass-1', GUEST2_PASSWORD: 'guest2-pass-1', GUEST2_NAME: '妈妈', GUEST3_PASSWORD: 'short',
+    GUEST4_PASSWORD: 'guest4-pass ', GUEST5_PASSWORD: 'guest5-pass-1', GUEST5_NAME: 'my mom' });
   const admin = await login('admin', 'admin-pass-1');
   const g1 = await login('guest1', 'guest1-pass-1');
   const mom = await login('妈妈', 'guest2-pass-1');
   ok(admin.status === 200 && g1.status === 200 && mom.status === 200, '管理员、guest1、改了名的 guest2（妈妈）都能用环境变量里的密码登录');
   ok((await login('guest3', 'short')).status === 401 && r.log().includes('GUEST3_PASSWORD 太短'), '密码太短（< 8 位）的 GUEST3 不创建，日志里有提示');
+  const warns = (await call(admin.cookie, 'GET', '/api/users')).j.envWarnings || [];
+  ok(warns.some(w => w.includes('GUEST3_PASSWORD 太短')) && warns.some(w => w.includes('GUEST4_PASSWORD') && w.includes('空格')) && warns.some(w => w.includes('GUEST5_NAME「my mom」不合法')),
+    '用户权限页能看到环境变量账号的问题（太短、多了空格、用户名不合法）', `${warns.length} 条`);
+  ok((await login('guest4', 'guest4-pass ')).status === 200 && (await login('guest4', 'guest4-pass')).status === 401, '密码末尾的空格算密码的一部分（所以要提示）');
+  ok((await call(g1.cookie, 'GET', '/api/users')).status === 403, '非管理员看不到这些提示');
   const p = g1.user?.perms || {};
   ok(g1.user?.role === 'user' && g1.user?.env === 'GUEST1' && p.maxLevel === 'edit' && p.clis.join() === 'claude' && p.dailyLimit === 50,
     'guest 默认权限：成员、只能用 Claude、最高「可改文件」、每天 50 条', JSON.stringify(p));

@@ -707,15 +707,19 @@ async function viewUsers(m) {
   m.innerHTML = `<div class="page"><div class="page-inner">
     <div class="page-head"><div><h2>用户与权限</h2></div>
       <button class="btn primary" id="addUser">＋ 添加用户</button></div>
+    <div id="envWarn"></div>
     <div class="card" style="overflow:auto"><table class="list" id="userTable"></table></div></div></div>`;
   $('#addUser').onclick = () => userDialog();
   const r = await tryApi('GET', '/api/users'); S.users = r.users; renderUsers();
+  // 环境变量账号有问题（密码太短、用户名不合法、多了空格或引号…）时直接在这里提示，不用去部署平台翻日志
+  const w = r.envWarnings || [];
+  $('#envWarn').innerHTML = w.length ? `<div class="errbox" style="margin:0 0 14px"><b>环境变量账号有问题</b>（改好部署平台上的环境变量后，服务重启就会生效）${w.map(x => `<div>· ${esc(x)}</div>`).join('')}</div>` : '';
 }
 const listText = l => !l || l.includes('*') ? '全部' : l.length ? l.join('、') : '无';
 function renderUsers() {
   const tb = $('#userTable'); if (!tb) return;
   tb.innerHTML = `<tr><th>用户</th><th>角色</th><th class="hide-m">CLI</th><th class="hide-m">设备 / 目录</th><th>最高权限</th><th>今日 / 额度</th><th></th></tr>` + S.users.map(u => `
-    <tr><td><b>${esc(u.username)}</b>${u.env ? ` <span class="chip" title="密码由部署平台的环境变量 ${esc(u.env === 'ADMIN' ? 'ADMIN_PASSWORD' : u.env + '_PASSWORD')} 设置">环境变量</span>` : ''}${u.disabled ? ' <span class="chip failed">已停用</span>' : ''}</td>
+    <tr><td><b>${esc(u.username)}</b>${u.env ? ` <span class="chip" title="密码由部署平台的环境变量 ${esc(u.env === 'ADMIN' ? 'ADMIN_PASSWORD' : u.env + '_PASSWORD')} 设置；登录用户名就是左边这个">环境变量 · ${esc(u.env)}</span>` : ''}${u.disabled ? ' <span class="chip failed">已停用</span>' : ''}</td>
       <td>${u.role === 'admin' ? '<span class="chip running">管理员</span>' : '<span class="chip">成员</span>'}</td>
       <td class="hide-m">${esc(listText(u.perms.clis))}</td>
       <td class="hide-m">${esc(listText(u.perms.agents))}<div class="faint">${esc(listText(u.perms.workspaces))}</div></td>

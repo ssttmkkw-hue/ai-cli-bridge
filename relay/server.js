@@ -178,8 +178,17 @@ const GUEST_PERMS = () => ({
   dailyLimit: Math.max(0, Number(process.env.GUEST_DAILY_LIMIT ?? 50) || 0),
 });
 function kickUser(id) { for (const [k, s] of sessions) if (s.userId === id) sessions.delete(k); }
+// 环境变量账号的问题：除了写日志，也放在「用户权限」页顶部给管理员看（不用去部署平台翻日志）
+const envWarnings = [];
 function syncEnvAccounts() {
   let changed = false;
+  const warn = msg => { envWarnings.push(msg); console.error('[relay] ' + msg); };
+  // 常见的手误：值两边多了引号或空格（密码不会自动去掉空格，登录时也得输入）
+  const checkValue = (key, v) => {
+    if (/^\s|\s$/.test(v)) warn(`${key} 的值开头或结尾有空格；登录时也要带上这些空格，建议去掉`);
+    if (/^(["'“”]).*\1$/.test(v.trim()) || /^["“].*["”]$/.test(v.trim())) warn(`${key} 的值两边有引号；引号会被当成密码的一部分，建议去掉`);
+  };
+  if (process.env.ADMIN_PASSWORD) checkValue('ADMIN_PASSWORD', process.env.ADMIN_PASSWORD);
   const setPw = (u, pw) => { if (checkPassword(u, pw)) return false; Object.assign(u, hashPassword(pw)); kickUser(u.id); changed = true; return true; };
   const adminPw = process.env.ADMIN_PASSWORD || '';
   if (adminPw) {
@@ -197,12 +206,13 @@ function syncEnvAccounts() {
       if (u && !u.disabled) { u.disabled = true; kickUser(u.id); changed = true; console.log(`[relay] 没有设置 ${tag}_PASSWORD，账号 ${u.username} 已停用`); }
       continue;
     }
-    if (pw.length < 8) { console.error(`[relay] 环境变量 ${tag}_PASSWORD 太短（至少 8 位），跳过这个账号`); continue; }
-    if (!/^[\w一-龥.-]{2,24}$/.test(name)) { console.error(`[relay] ${tag}_NAME「${name}」不合法（2-24 位字母、数字、中文），跳过这个账号`); continue; }
+    checkValue(tag + '_PASSWORD', pw);
+    if (pw.length < 8) { warn(`${tag}_PASSWORD 太短（现在 ${pw.length} 位，至少 8 位），这个账号没有创建`); continue; }
+    if (!/^[\w一-龥.-]{2,24}$/.test(name)) { warn(`${tag}_NAME「${name}」不合法：只能用字母、数字、中文和 _ . -，2～24 位（不能有空格），这个账号没有创建`); continue; }
     const clash = users.find(x => x.username === name && x !== u);
     if (clash) {
       if (!u && !clash.env) { u = clash; u.env = tag; changed = true; } // 网页上建过同名账号：接管它
-      else { console.error(`[relay] ${tag}_NAME「${name}」和已有账号重名，跳过这个账号`); continue; }
+      else { warn(`${tag}_NAME「${name}」和已有账号重名，这个账号没有创建`); continue; }
     }
     if (!u) {
       users.push({ id: newId('u'), username: name, role: 'user', disabled: false, createdAt: Date.now(), env: tag, perms: GUEST_PERMS(), ...hashPassword(pw) });
@@ -778,7 +788,7 @@ async function handle(req, res) {
   if (p.startsWith('/api/users')) {
     if (!isAdmin) fail(403, '需要管理员');
     if (p === '/api/users' && m === 'GET') {
-      return send(res, 200, { users: users.map(u => ({ ...publicUser(u), today: tasksToday(u.id), total: db.tasks.filter(t => t.userId === u.id).length })) });
+      return send(res, 200, { users: users.map(u => ({ ...publicUser(u), today: tasksToday(u.id), total: db.tasks.filter(t => t.userId === u.id).length })), envWarnings });
     }
     if (p === '/api/users' && m === 'POST') {
       const b = await readBody(req);
