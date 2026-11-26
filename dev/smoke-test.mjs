@@ -193,6 +193,19 @@ if (agent.confine && agent.workspaces?.find(w => w.name === WS)?.isolate) {
   ok(esc.every(p => f.text.includes(`执行 ${p}：失败`)) && f.text.includes('执行 /bin/ls：成功'), '沙盒里不能用 open / osascript / launchctl 绕出去，普通命令照常');
 } else console.log('- 跳过文件夹限制测试：', agent.confine ? `${WS} 没开 isolate` : '这台设备没开文件夹限制（只支持 macOS）');
 
+// 3d. 订阅额度：网页让 Mac 跑一次 `claude -p /usage`（不调用模型、不花额度），解析出 5 小时 / 本周 / 恢复时间
+ok((await fetch(B + '/api/quota')).status === 401
+  && (await fetch(B + '/api/agent/quota', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agent: AGENT, quota: { windows: [{ key: 'five_hour', percent: 99 }] } }) })).status === 401,
+  '额度：未登录看不到，没有 agent token 不能上报');
+if (agent.clis?.claude?.ok) {
+  const t0 = Date.now();
+  const q = (await A('POST', '/api/quota', { agent: AGENT })).j;
+  const w = Object.fromEntries((q?.quota?.windows || []).map(x => [x.key, x]));
+  ok(!q?.error && w.five_hour && w.seven_day && [w.five_hour, w.seven_day].every(x => x.percent >= 0 && x.percent <= 100 && x.resetsAt > Date.now() - 3600000),
+    '额度：从 /usage 读出 5 小时和本周额度、恢复时间', q?.error || `5 小时 ${w.five_hour?.percent}%，本周 ${w.seven_day?.percent}%，${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  ok((await A('GET', '/api/quota?agent=' + AGENT)).j?.quota?.at > t0 - 1000, '额度：查询结果会缓存，GET 能直接拿到');
+} else console.log('- 跳过额度测试：这台设备没有 Claude Code');
+
 // 4. 权限隔离
 const stamp = Date.now().toString(36);
 const name = 'smoke' + stamp;

@@ -8,7 +8,7 @@
 - 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
 - Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
 - Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
-- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 34 项，全部通过。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 37 项，全部通过。
 
 ## 架构
 
@@ -30,10 +30,12 @@
 | 存储 | `config.json`（agent token）、`users.json`、`db.json`（convs / tasks / uploads）、`sessions.json`（登录会话，只存 token 的 sha256）、`files/<id>`（文件本体）。`saveSoon()` 每秒落盘一次 |
 | 用户与权限 | scrypt 密码；`perms = { clis, agents, workspaces, maxLevel, dailyLimit }`，`'*'` 表示全部；`checkRunPerms()` 是建对话 / 发消息时的总闸 |
 | 派发 | `pickTasksFor(agent, free)`：同一对话串行（保证 resume 顺序）；同一设备的同一工作目录也串行（产出靠目录前后对比收集，并发会串到别的任务甚至别的用户），`isolate` 的目录除外（每个对话独立子文件夹）；因目录排队的任务带 `waitingFor: 'workspace'`；派发内容带 `convId`、`username` 供 agent 算子文件夹；派出时带上 `conv.sessionId` 作为 `resumeSessionId`；`wakeAgent()` 立即返回挂着的长轮询 |
+| 订阅额度 | `quotaFromRateLimit()` 解析任务输出里的 `rate_limit_event.unifiedWindows`（`five_hour`、`seven_day`…，`utilization` 0~1，`resetsAt` 秒）；`runProbe()` 运行 `claude -p --output-format json`、stdin 写 `/usage`（`<synthetic>` 模型，不花额度，不进文件夹沙盒，因为要读本机所有会话的统计），`quotaFromUsageText()` 解析 `Current session: 37% used · resets Nov 26 at 11:09pm (Asia/Tokyo)` 这种行，`zonedToEpoch()` 按里面的时区换成时间戳 |
 | 停止 | `cancelRequested` + `cancelSentAt`（指令只发一次，10 秒后补发一次）；30 秒还没停，中继直接判为已取消 |
 | 掉线 | 执行端 45 秒没轮询即视为离线；已派发的任务 90 秒没有回音就判失败；中继重启时正在跑的任务判失败 |
 | 文件 | `POST /api/agent/files`（agent 上传产出）、`GET /api/agent/files/:id`（agent 取附件）、`POST /api/uploads`（用户上传，需要 `X-Upload: 1` 头防 CSRF）、`GET /api/files/:id`（只有能看到这个任务的人能访问；HTML/SVG 带 `CSP: sandbox`） |
 | 推送 | `/api/stream` SSE，事件 `task`（任务摘要，不含 events）、`chunk`（新增输出）、`agents`（设备列表） |
+| 订阅额度 | agent 每个记录挂 `quota`（最近一次）和 `probes`（待执行的即时查询）。`POST /api/quota` → `requestProbe()` 把 `{kind:"usage"}` 塞进长轮询的返回值（`probes`），最多等 45 秒；agent 跑完 `POST /api/agent/quota` 带 `probeId` 回来。agent 平时在任务输出里看到 `rate_limit_event` 也会上报（20 秒最多一次）。`sanitizeQuota()` 只留 `key/label/percent/resetsAt/resetsText/status` |
 | 备份导出 | `GET /api/convs/:id/export`、`GET /api/export`（`?all=1` 管理员导出所有人）→ `relay/export.js` 的 `exportConvs()`：先 `plan()` 决定每个文件在 zip 里的位置（同一任务同一路径只打包一份；回答里的「引用」不算新版本；最终版放 `files/`，被后面改掉的放 `history/t<N>/`），再用 `relay/zip.js` 的 `ZipWriter` 边读边写进响应（一次只读一个文件；文件名 UTF-8 标记 + 0x7075 扩展字段；我们自己起的目录名只用英文）。`index.html` 把 `style.css`、`render.js`、`export-viewer.js` 和数据内嵌进去 |
 
 ### agent/agent.js（执行端）
@@ -74,7 +76,7 @@
 
 ```bash
 npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
-node dev/smoke-test.mjs  # 另开终端，34 项冒烟测试，不花额度
+node dev/smoke-test.mjs  # 另开终端，37 项冒烟测试，不花额度
 npm run check            # 只做语法检查
 ```
 
@@ -109,7 +111,7 @@ npm run check            # 只做语法检查
 - [ ] `brew install node`，`node -v` ≥ 18
 - [ ] `claude` 登录；`codex login`
 - [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
-- [ ] `node dev/smoke-test.mjs` 34 项全过
+- [ ] `node dev/smoke-test.mjs` 37 项全过
 - [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
 - [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
 - [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览

@@ -202,7 +202,7 @@ function agentOnline(a) { return a && Date.now() - a.lastSeen < 45000; }
 function publicAgent(a) {
   return {
     name: a.name, platform: a.platform, hostname: a.hostname, online: agentOnline(a),
-    clis: a.clis, workspaces: a.workspaces, maxConcurrent: a.maxConcurrent, confine: !!a.confine,
+    clis: a.clis, workspaces: a.workspaces, maxConcurrent: a.maxConcurrent, confine: !!a.confine, quota: a.quota || null,
     running: [...a.running], lastSeen: a.lastSeen, version: a.version,
   };
 }
@@ -377,6 +377,7 @@ async function handle(req, res) {
       const a = {
         name: String(b.name).slice(0, 40), platform: b.platform, hostname: b.hostname, version: b.version,
         clis: b.clis || {}, workspaces: b.workspaces || [], maxConcurrent: b.maxConcurrent || 1, confine: !!b.confine,
+        quota: old?.quota || null, probes: old?.probes || [], // 订阅额度（最近一次）、待执行的即时查询
         lastSeen: Date.now(), running: old?.running || new Set(), waiter: null,
       };
       agents.set(a.name, a);
@@ -403,10 +404,11 @@ async function handle(req, res) {
         const cancel = db.tasks.filter(t => t.agent === name && t.cancelRequested && (t.status === 'running' || t.status === 'dispatched')
           && (!t.cancelSentAt || now - t.cancelSentAt > 10000)).map(t => { t.cancelSentAt = now; return t.id; });
         const tasks = pickTasksFor(a, free);
-        return { tasks, cancel };
+        const probes = (a.probes || []).splice(0); // 即时查询（额度）不占任务名额
+        return { tasks, cancel, probes };
       };
       let r = collect();
-      if (r.tasks.length || r.cancel.length) return send(res, 200, r);
+      if (r.tasks.length || r.cancel.length || r.probes.length) return send(res, 200, r);
       // 长轮询：最多挂 25 秒，有新任务立即返回
       let done = false;
       const finish = () => {
@@ -418,6 +420,15 @@ async function handle(req, res) {
       a.waiter = finish;
       req.on('close', () => { done = true; clearTimeout(timer); if (a.waiter === finish) a.waiter = null; });
       return;
+    }
+    // agent 上报订阅额度：任务里顺带看到的，或者回复网页的即时查询（probeId）
+    if (p === '/api/agent/quota' && m === 'POST') {
+      const b = await readBody(req);
+      const a = agents.get(b.agent); if (!a) fail(409, '请先 hello');
+      const q = sanitizeQuota(b.quota);
+      if (q) { a.quota = { ...q, at: Date.now() }; pushAgents(); }
+      if (b.probeId) probeWaiters.get(b.probeId)?.({ quota: a.quota, error: q ? null : String(b.error || '查询失败').slice(0, 300) });
+      return send(res, 200, { ok: true });
     }
     // agent 上传 AI 产出的文件（原始字节），返回文件 id
     if (p === '/api/agent/files' && m === 'POST') {
@@ -685,6 +696,21 @@ async function handle(req, res) {
     return sendFile(req, res, hit.meta, url.searchParams.get('dl') === '1');
   }
 
+  // 订阅额度：GET 拿最近一次的；POST 让 Mac 立刻查一次（相当于在 Mac 上运行 /usage）
+  if (p === '/api/quota') {
+    const name = url.searchParams.get('agent') || (m === 'POST' ? (await readBody(req)).agent : null);
+    const list = visibleAgents(user);
+    const pa = list.find(x => x.name === name) || list.find(x => x.online) || list[0];
+    if (!pa) fail(404, '没有可用的设备');
+    const a = agents.get(pa.name);
+    if (m === 'GET') return send(res, 200, { agent: a.name, online: agentOnline(a), quota: a.quota });
+    if (m === 'POST') {
+      if (!agentOnline(a)) return send(res, 200, { agent: a.name, online: false, quota: a.quota, error: 'Mac 离线，显示的是上次的数据' });
+      const r = await requestProbe(a, 'usage');
+      return send(res, 200, { agent: a.name, online: true, quota: r.quota, error: r.error || null });
+    }
+  }
+
   if (p === '/api/stats' && m === 'GET') {
     const mine = isAdmin ? db.tasks : db.tasks.filter(t => t.userId === user.id);
     const by = {}; for (const t of mine) by[t.status] = (by[t.status] || 0) + 1;
@@ -756,6 +782,28 @@ function sanitizePerms(p) {
     maxLevel: LEVELS.includes(p.maxLevel) ? p.maxLevel : 'read',
     dailyLimit: Math.max(0, Math.min(100000, Number(p.dailyLimit) || 0)),
   };
+}
+// 订阅额度：只留网页要用的字段，防止 agent 传来奇怪的东西
+function sanitizeQuota(q) {
+  if (!q || !Array.isArray(q.windows)) return null;
+  const windows = q.windows.slice(0, 8).map(w => ({
+    key: String(w.key || '').slice(0, 40), label: String(w.label || '').slice(0, 40),
+    percent: Math.max(0, Math.min(100, Math.round(Number(w.percent) || 0))),
+    resetsAt: Number(w.resetsAt) || null, resetsText: w.resetsText ? String(w.resetsText).slice(0, 80) : undefined,
+    status: w.status ? String(w.status).slice(0, 30) : undefined,
+  })).filter(w => w.key);
+  return windows.length ? { windows, source: q.source === 'usage' ? 'usage' : 'task' } : null;
+}
+// 网页点「额度」：让 agent 立刻跑一次 /usage，最多等 45 秒
+const probeWaiters = new Map(); // probeId → resolve
+function requestProbe(a, kind) {
+  return new Promise(resolve => {
+    const id = newId('p');
+    const timer = setTimeout(() => { probeWaiters.delete(id); resolve({ quota: a.quota, error: '等待 Mac 回应超时' }); }, 45000);
+    probeWaiters.set(id, r => { clearTimeout(timer); probeWaiters.delete(id); resolve(r); });
+    (a.probes ||= []).push({ id, kind });
+    wakeAgent(a.name);
+  });
 }
 function sanitizeOutputs(list, t) {
   const str = (v, n) => String(v ?? '').slice(0, n);

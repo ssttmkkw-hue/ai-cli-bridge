@@ -301,6 +301,7 @@ async function loop() {
         else if (!recentlyFinished.has(id)) queueUpdate(id, { final: { status: 'cancelled', error: '已停止（执行端上没有在运行）' } });
       }
       for (const t of r.tasks || []) startTask(t);
+      for (const pr of r.probes || []) runProbe(pr); // 网页要的即时查询（目前只有额度）
     } catch (e) {
       if (e.name === 'AbortError') continue; // 有空位了，立刻重新领任务
       if (e.status === 409 || e.status === 401) greeted = false;
@@ -309,6 +310,83 @@ async function loop() {
       await sleep(backoff); backoff = Math.min(backoff * 2, 30000); greeted = false;
     }
   }
+}
+
+// ---------------------------------------------------------------- 订阅额度（5 小时 / 每周 / 恢复时间）
+// 两个来源，统一成 { windows: [{ key, label, percent, resetsAt(毫秒时间戳), resetsText, status }], source }：
+//   1. 任务运行时 Claude Code 输出的 rate_limit_event（数字准确、恢复时间是时间戳）
+//   2. 网页点「额度」时，运行一次 `claude -p /usage`（不调用模型、不花额度），解析它的文字输出
+const WINDOW_LABEL = { five_hour: '5 小时额度', seven_day: '本周（所有模型）' };
+const windowLabel = key => WINDOW_LABEL[key] || (key.startsWith('seven_day_') ? `本周（${key.slice(10).replace(/^\w/, c => c.toUpperCase())}）` : key);
+function quotaFromRateLimit(info) {
+  const w = info?.unifiedWindows; if (!w) return null;
+  const windows = Object.entries(w).map(([key, v]) => ({
+    key, label: windowLabel(key), percent: Math.round((Number(v.utilization) || 0) * 100),
+    resetsAt: v.resetsAt ? v.resetsAt * 1000 : null, status: v.status || null,
+  })).sort((a, b) => (a.key === 'five_hour' ? -1 : b.key === 'five_hour' ? 1 : a.key.localeCompare(b.key)));
+  return windows.length ? { windows, source: 'task' } : null;
+}
+// 某个时区里的「墙上时间」→ 时间戳（/usage 输出的是 "Nov 26 at 11:09pm (Asia/Tokyo)" 这种）
+function zonedToEpoch(y, mo, d, h, mi, tz) {
+  const guess = Date.UTC(y, mo, d, h, mi);
+  try {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric' })
+      .formatToParts(new Date(guess)).map(p => [p.type, p.value]));
+    const asTz = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour % 24, +parts.minute);
+    return guess - (asTz - guess); // 减去该时区相对 UTC 的偏移
+  } catch { return null; }
+}
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+function parseResets(text) {
+  // 例：Nov 26 at 11:09pm (Asia/Tokyo)；也兼容只有时间的写法：11:09pm (Asia/Tokyo)
+  const m = String(text || '').match(/(?:([A-Za-z]{3})[a-z]*\s+(\d{1,2})\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?/i);
+  if (!m) return null;
+  const now = new Date(), tz = m[6] || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  let h = +m[3] % 12; if (m[5].toLowerCase() === 'pm') h += 12;
+  const mo = m[1] ? MONTHS[m[1].toLowerCase()] : now.getMonth(), d = m[2] ? +m[2] : now.getDate();
+  if (mo == null) return null;
+  let t = zonedToEpoch(now.getFullYear(), mo, d, h, +(m[4] || 0), tz);
+  if (t && t < Date.now() - 86400000) t = zonedToEpoch(now.getFullYear() + 1, mo, d, h, +(m[4] || 0), tz); // 跨年
+  if (t && !m[1] && t < Date.now()) t += 86400000; // 只有时间：已经过了就是明天
+  return t;
+}
+function quotaFromUsageText(text) {
+  const windows = [];
+  for (const line of String(text).split('\n')) {
+    const s = line.trim();
+    let m = s.match(/^Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s+(.+))?$/i);
+    if (m) { windows.push({ key: 'five_hour', label: windowLabel('five_hour'), percent: +m[1], resetsText: m[2] || '', resetsAt: parseResets(m[2]) }); continue; }
+    m = s.match(/^Current week\s*\(([^)]+)\):\s*(\d+)%\s*used(?:\s*·\s*resets\s+(.+))?$/i);
+    if (m) {
+      const key = /all/i.test(m[1]) ? 'seven_day' : 'seven_day_' + m[1].toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      windows.push({ key, label: windowLabel(key), percent: +m[2], resetsText: m[3] || '', resetsAt: parseResets(m[3]) });
+    }
+  }
+  return windows.length ? { windows, source: 'usage' } : null;
+}
+let lastQuotaReport = 0;
+function reportQuota(q, probeId, error) {
+  if (!probeId && Date.now() - lastQuotaReport < 20000) return; // 任务里的额度事件很频繁，20 秒最多报一次
+  lastQuotaReport = Date.now();
+  api('POST', '/api/agent/quota', { agent: cfg.name, probeId, quota: q || null, error: error || null }).catch(e => console.error('[agent] 上报额度失败', e.message));
+}
+function runProbe(pr) {
+  if (pr.kind !== 'usage') return reportQuota(null, pr.id, '不支持的查询');
+  const c = clis.claude;
+  if (!c?.ok) return reportQuota(null, pr.id, '这台设备没有可用的 Claude Code');
+  // 固定命令、不带用户输入、不调用模型；要读本机所有会话的统计，所以不进文件夹沙盒
+  const child = spawn(c.bin, [...c.prefixArgs, '-p', '--output-format', 'json'], { cwd: os.tmpdir(), env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  let out = '', done = false;
+  const end = (q, err) => { if (done) return; done = true; clearTimeout(timer); reportQuota(q, pr.id, err); };
+  const timer = setTimeout(() => { child.kill(); end(null, '查询超时'); }, 40000);
+  child.stdout.setEncoding('utf8'); child.stdout.on('data', d => (out += d));
+  child.on('error', e => end(null, '启动失败：' + e.message));
+  child.on('close', () => {
+    let text = out; try { text = JSON.parse(out).result || out; } catch {}
+    const q = quotaFromUsageText(text);
+    end(q, q ? null : '没能从 /usage 的输出里读出额度：' + short(text, 200));
+  });
+  child.stdin.on('error', () => {}); child.stdin.end('/usage');
 }
 
 // ---------------------------------------------------------------- 构造命令行
@@ -373,6 +451,9 @@ function makeParser(kind, emit) {
               emit({ events: [{ k: 'tool_out', d: short(txt, 600), err: !!b.is_error }] });
             }
           }
+        } else if (o.type === 'rate_limit_event') {
+          const q = quotaFromRateLimit(o.rate_limit_info); // 顺便记下订阅额度，网页「额度」面板用
+          if (q) reportQuota(q);
         } else if (o.type === 'result') {
           st.result = o.result || '';
           st.isError = !!o.is_error;

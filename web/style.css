@@ -84,6 +84,17 @@ a.icon-btn { text-decoration: none; color: inherit; display: inline-grid; place-
 .chat-head .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-head .meta { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; min-width: 0; }
 .msgs { flex: 1; overflow: auto; padding: 22px 18px 8px; }
+/* 额度面板：右上角 📊 下拉，或对话里发 /usage */
+.quota-pop { position: fixed; top: 60px; right: 12px; z-index: 45; width: min(360px, calc(100vw - 24px)); padding: 14px 16px; box-shadow: var(--shadow); }
+.quota-card { padding: 14px 16px; max-width: 420px; }
+.qtop { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.qrow { margin: 10px 0 12px; }
+.qhead { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; }
+.qpct { font-size: 13px; color: var(--sub); } .qpct.warn { color: var(--warn); } .qpct.bad { color: var(--bad); }
+.qbar { height: 8px; border-radius: 99px; background: var(--panel2); overflow: hidden; margin: 6px 0 4px; }
+.qbar i { display: block; height: 100%; background: var(--accent); border-radius: 99px; transition: width .3s; }
+.qbar i.warn { background: var(--warn); } .qbar i.bad { background: var(--bad); }
+.qrow .faint, .qfoot { font-size: 12.5px; }
 /* 新对话顶部：设备 + CLI + 模型，直接点选 */
 .newchat { border-bottom: 1px solid var(--line); background: var(--panel); padding: 12px 18px; flex: none; }
 .newchat-inner { max-width: 860px; margin: 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
