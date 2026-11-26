@@ -7,7 +7,7 @@ const path = require('path');
 const { spawn, execFile, execFileSync } = require('child_process');
 
 const { SessionIndex, originalDirectory } = require('./session-index');
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const cfgPath = path.resolve(process.argv[2] || process.env.AGENT_CONFIG || path.join(__dirname, 'agent.config.json'));
 if (!fs.existsSync(cfgPath)) {
   console.error(`[agent] 找不到配置 ${cfgPath}，请复制 agent.config.example.json 改一份`);
@@ -106,6 +106,7 @@ function authOf(kind, bin, prefixArgs = []) {
 // 子进程环境：去掉宿主 Claude Code 注入的变量，避免嵌套调用时继承宿主身份/配置
 function childEnv() {
   const env = { ...process.env };
+  delete env.MY_ACCOUNTS;
   const nested = !!env.CLAUDE_CODE_SESSION_ID || !!env.CLAUDECODE;
   for (const k of Object.keys(env)) {
     if (k === 'CLAUDECODE' || k.startsWith('CLAUDE_CODE_') || k.startsWith('CLAUDE_AGENT_SDK') || k === 'CLAUDE_PID') delete env[k];
@@ -330,7 +331,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function hello() {
   await api('POST', '/api/agent/hello', {
-    name: cfg.name, sessionRecovery: true, platform: process.platform, hostname: os.hostname(), version: VERSION,
+    name: cfg.name, sessionRecovery: true, sessionListing: true, platform: process.platform, hostname: os.hostname(), version: VERSION,
     maxConcurrent: cfg.maxConcurrent, running: [...running.keys()], confine: CONFINE,
     clis: publicClis(),
     workspaces: workspaces.map(({ name, maxLevel, note, isolate }) => ({ name, maxLevel, note, isolate })),
@@ -469,6 +470,10 @@ async function fsGet(pr) {
   if (!r.ok) throw new Error('上传失败：' + r.status);
 }
 function runProbe(pr) {
+  if (pr.kind === 'listSessions') {
+    try { probeReply(pr.id, sessions.list(pr)); } catch (e) { probeReply(pr.id, null, e.message); }
+    return;
+  }
   if (pr.kind === 'resume') {
     sessions.lookup(pr).then(hit => probeReply(pr.id, hit), e => probeReply(pr.id, null, e.message)); return;
   }

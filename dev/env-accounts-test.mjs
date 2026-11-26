@@ -33,7 +33,10 @@ const call = async (ck, m, u, b) => {
 try {
   // ---- 第一次启动
   let r = await relay({ ADMIN_PASSWORD: 'admin-pass-1', GUEST1_PASSWORD: 'guest1-pass-1', GUEST2_PASSWORD: 'guest2-pass-1', GUEST2_NAME: '妈妈', GUEST3_PASSWORD: 'short',
-    GUEST4_PASSWORD: 'guest4-pass ', GUEST5_PASSWORD: 'guest5-pass-1', GUEST5_NAME: 'my mom' });
+    MY_ACCOUNTS: '小林:example:passA,小陈:example-passB', GUEST4_PASSWORD: 'guest4-pass ', GUEST5_PASSWORD: 'guest5-pass-1', GUEST5_NAME: 'my mom' });
+  const named = await login('小林', 'example:passA');
+  ok(named.status === 200 && named.user?.username === '小林' && named.user?.role === 'user' &&
+    (await login('小陈', 'example-passB')).status === 200, '具名访客用各自的名字登录，密码支持冒号');
   const admin = await login('admin', 'admin-pass-1');
   const g1 = await login('guest1', 'guest1-pass-1');
   const mom = await login('妈妈', 'guest2-pass-1');
@@ -57,7 +60,10 @@ try {
   await r.stop();
 
   // ---- 第二次启动：改 guest1 密码、删掉 guest2、改管理员密码
-  r = await relay({ ADMIN_PASSWORD: 'admin-pass-2', GUEST1_PASSWORD: 'guest1-pass-2' });
+  r = await relay({ ADMIN_PASSWORD: 'admin-pass-2', GUEST1_PASSWORD: 'guest1-pass-2', MY_ACCOUNTS: '小林:new-example-pass' });
+  ok((await call(named.cookie, 'GET', '/api/me')).status === 401 && (await login('小林', 'example:passA')).status === 401 &&
+    (await login('小林', 'new-example-pass')).user?.id !== named.user.id && (await login('小陈', 'example-passB')).status === 401,
+    '具名账号换密码后进入新租期，移除的账号不能登录');
   ok((await call(g1.cookie, 'GET', '/api/me')).status === 401, 'guest1 改了密码：之前登录的设备被踢下线');
   ok((await login('guest1', 'guest1-pass-1')).status === 401 && (await login('guest1', 'guest1-pass-2')).status === 200, 'guest1：旧密码不能用，新密码能登录');
   ok((await login('妈妈', 'guest2-pass-1')).status === 401 && r.log().includes('账号 妈妈 已停用'), '删掉 GUEST2_PASSWORD 后，「妈妈」账号停用');

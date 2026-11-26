@@ -113,7 +113,7 @@ function onChunk({ taskId, events }) {
 // ============================================================ 总渲染
 function render() {
   const app = $('#app');
-  if (!S.me) { app.innerHTML = loginHTML(); bindLogin(); return; }
+  if (!S.me) { document.querySelectorAll('.mask').forEach(m => m.remove()); app.innerHTML = loginHTML(); bindLogin(); return; }
   const admin = isAdmin();
   if (!admin) S.view = 'chat'; // 非管理员只有对话页
   const tabs = admin ? [['chat', '对话'], ['tasks', '任务'], ['agents', '设备'], ['users', '用户权限']] : [];
@@ -127,7 +127,7 @@ function render() {
     <div class="quota-pop card" id="quotaPop" ${S.quotaOpen ? '' : 'hidden'}></div>
     <div class="main" id="main"></div>`;
   app.querySelectorAll('.nav button').forEach(b => b.onclick = () => { S.view = b.dataset.v; S.sideOpen = false; location.hash = S.view; render(); });
-  $('#logout').onclick = async () => { await api('POST', '/api/logout'); S.es?.close(); S.me = null; render(); };
+  $('#logout').onclick = async () => { await api('POST', '/api/logout'); S.es?.close(); location.reload(); };
   if ($('#pwBtn')) $('#pwBtn').onclick = changePassword;
   $('#prefBtn').onclick = prefsDialog;
   if ($('#quotaBtn')) $('#quotaBtn').onclick = () => setQuotaOpen(!S.quotaOpen);
@@ -254,8 +254,8 @@ function bindLogin() {
     e.preventDefault();
     btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 登录中…'; err.textContent = '';
     try {
-      const r = await api('POST', '/api/login', { username: form.username.value.trim(), password: pw.value });
-      S.me = r.user; render(); afterLogin();
+      await api('POST', '/api/login', { username: form.username.value.trim(), password: pw.value });
+      location.reload();
     } catch (e2) {
       err.textContent = e2.message; btn.disabled = false; btn.textContent = '登录';
       form.classList.remove('shake'); void form.offsetWidth; form.classList.add('shake'); // 密码错了晃一下
@@ -304,13 +304,14 @@ function modal(inner, onOk, { okText = '确定', wide = false, noFoot = false } 
 function viewChat(m) {
   m.innerHTML = `
     <aside class="side ${S.sideOpen ? 'open' : ''}" id="side">
-      <div class="side-head"><button class="btn primary" id="newConv">＋ 新对话</button></div>
+      <div class="side-head"><button class="btn primary" id="newConv">＋ 新对话</button><button class="btn" id="recoverConvs">找回我的对话</button></div>
       <div class="convs" id="convList"></div>
       <div class="side-foot"><button class="btn" id="filesBtn" title="浏览、下载 Mac 上你的文件夹里的文件">📁 我的文件</button><a class="btn" href="/api/export" download title="所有对话打成一个 zip，解压后双击 index.html 查看">⬇ 备份</a></div>
     </aside>
     <div class="side-mask ${S.sideOpen ? 'open' : ''}" id="sideMask"></div>
     <section class="chat" id="chat"></section>`;
   $('#newConv').onclick = () => { setSide(false); S.conv = null; S.tasks = new Map(); S.draft = null; renderConvList(); renderChat(); $('#input')?.focus(); };
+  $('#recoverConvs').onclick = recoverDialog;
   $('#sideMask').onclick = () => setSide(false);
   $('#filesBtn').onclick = () => { setSide(false); filesDialog(); };
   renderConvList();
@@ -329,6 +330,31 @@ function renderConvList() {
       <div class="s">${esc(convSub(c))} · ${fmtTime(c.updatedAt)}</div></div>`).join('')
     : S.loaded ? '<div class="empty">还没有对话</div>' : '';
   el.querySelectorAll('.conv').forEach(d => d.onclick = () => { setSide(false); openConv(d.dataset.id); });
+}
+async function recoverDialog() {
+  const me = S.me;
+  const m = modal('<div class="pv-head"><h3>找回我的对话</h3><button class="btn sm" data-x>关闭</button></div><div data-list aria-live="polite">正在查询 Mac…</div>', null, { noFoot: true });
+  const box = m.querySelector('[data-list]');
+  try {
+    const { convs, unavailable } = await api('GET', '/api/resume/list');
+    if (!m.isConnected || S.me !== me) return;
+    box.innerHTML = convs.map((c, i) => `<button type="button" class="recover-row" data-pick="${i}">
+      <b>${esc(c.title)}</b><small>${esc(c.agent)} · ${c.lastUsedAt ? fmtTime(c.lastUsedAt) : '旧记录未保存时间'}</small></button>`).join('') ||
+      '<div class="empty">当前账号和租期在已连接的 Mac 上没有可恢复的对话</div>';
+    if (unavailable.length) box.insertAdjacentHTML('beforeend', `<div class="faint">未能查询：${esc(unavailable.join('、'))}</div>`);
+    box.onclick = async e => {
+      const b = e.target.closest('[data-pick]');
+      if (!b || box.getAttribute('aria-busy') === 'true') return;
+      box.setAttribute('aria-busy', 'true');
+      const { id, agent } = convs[Number(b.dataset.pick)];
+      try {
+        const r = await tryApi('POST', '/api/resume', { id, agent });
+        if (!m.isConnected || S.me !== me) return;
+        if (!r.conv) return toast('会话已变化，请重新查询', true);
+        m.close(); setSide(false); showConversation(r); $('#input')?.focus();
+      } catch {} finally { box.removeAttribute('aria-busy'); }
+    };
+  } catch (e) { box.textContent = e.message; }
 }
 async function openConv(id) {
   const r = await tryApi('GET', '/api/convs/' + id);
@@ -788,10 +814,11 @@ async function viewUsers(m) {
   $('#envWarn').innerHTML = w.length ? `<div class="errbox" style="margin:0 0 14px"><b>环境变量账号有问题</b>（改好部署平台上的环境变量后，服务重启就会生效）${w.map(x => `<div>· ${esc(x)}</div>`).join('')}</div>` : '';
 }
 const listText = l => !l || l.includes('*') ? '全部' : l.length ? l.join('、') : '无';
+const accountEnvName = env => env === 'MY_ACCOUNTS' ? env : env + '_PASSWORD';
 function renderUsers() {
   const tb = $('#userTable'); if (!tb) return;
   tb.innerHTML = `<tr><th>用户</th><th>角色</th><th class="hide-m">CLI</th><th class="hide-m">设备 / 目录</th><th>最高权限</th><th>今日 / 额度</th><th></th></tr>` + S.users.map(u => `
-    <tr><td><b>${esc(u.username)}</b>${u.env ? ` <span class="chip" title="密码由部署平台的环境变量 ${esc(u.env === 'ADMIN' ? 'ADMIN_PASSWORD' : u.env + '_PASSWORD')} 设置；登录用户名就是左边这个">环境变量 · ${esc(u.env)}</span>` : ''}${u.disabled ? ' <span class="chip failed">已停用</span>' : ''}</td>
+    <tr><td><b>${esc(u.username)}</b>${u.env ? ` <span class="chip" title="密码由部署平台的环境变量 ${esc(accountEnvName(u.env))} 设置；登录用户名就是左边这个">环境变量 · ${esc(u.env)}</span>` : ''}${u.disabled ? ' <span class="chip failed">已停用</span>' : ''}</td>
       <td>${u.role === 'admin' ? '<span class="chip running">管理员</span>' : '<span class="chip">成员</span>'}</td>
       <td class="hide-m">${esc(listText(u.perms.clis))}</td>
       <td class="hide-m">${esc(listText(u.perms.agents))}<div class="faint">${esc(listText(u.perms.workspaces))}</div></td>
@@ -810,7 +837,7 @@ function userDialog(u) {
     ${all.map(v => `<label><input type="checkbox" data-g="${name}" value="${esc(v)}" ${cur.includes(v) || cur.includes('*') ? 'checked' : ''}>${esc(CLI_NAME[v] || v)}</label>`).join('')}</div>`;
   const m = modal(`<h3>${isNew ? '添加用户' : '编辑用户：' + esc(u.username)}</h3>
     ${isNew ? '<label class="field"><span>用户名</span><input class="input" id="uName"></label>' : ''}
-    ${u?.env ? `<div class="field"><span>密码</span><div class="muted" style="font-size:14px">由部署平台的环境变量 <code>${esc(u.env === 'ADMIN' ? 'ADMIN_PASSWORD' : u.env + '_PASSWORD')}</code> 设置，在这里改不了</div></div>`
+    ${u?.env ? `<div class="field"><span>密码</span><div class="muted" style="font-size:14px">由部署平台的环境变量 <code>${esc(accountEnvName(u.env))}</code> 设置，在这里改不了</div></div>`
       : `<label class="field"><span>${isNew ? '密码（至少 6 位）' : '重置密码（留空不改）'}</span><input class="input" id="uPw" type="text" autocomplete="off"></label>`}
     <label class="field"><span>角色</span><select class="input" id="uRole"><option value="user">成员</option><option value="admin" ${u?.role === 'admin' ? 'selected' : ''}>管理员（可管理用户、看所有任务）</option></select></label>
     <div class="field"><span>可用的 CLI</span>${checks('clis', allClis, p.clis)}</div>

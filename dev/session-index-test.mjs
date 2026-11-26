@@ -68,3 +68,20 @@ test('旧版管理员目录：唯一会话恢复，多条显式选择，忽略�
   const chosen = await load().lookup({ ...admin, choice: { workspace: 'demo', sessionId: another } });
   assert.equal(chosen.conv.sessionId, another);
 });
+
+test('恢复列表只返回本账号、本租期、有权限的会话摘要', t => {
+  const { dir, id, sessionId, task, load, pr } = fixture(t);
+  const scope = { ...pr, clis: ['claude'] };
+  const index = load();
+  index.remember({ ...task, title: '续写网页' }, dir, sessionId);
+  const [row] = load().list(scope);
+  assert.ok(row.lastUsedAt > 0);
+  assert.deepEqual(row, { id, title: '续写网页', lastUsedAt: row.lastUsedAt });
+  for (const change of [{ username: 'other' }, { ownerKey: 'next-lease' }, { clis: [] }, { workspaces: [] }]) {
+    assert.deepEqual(index.list({ ...scope, ...change }), []);
+  }
+  delete index.rows[id].lastUsedAt;
+  assert.equal(index.list(scope)[0].lastUsedAt, null);
+  index.forget({ ...pr, convId: id, revision: 1, remove: true });
+  assert.deepEqual(load().list(scope), []);
+});

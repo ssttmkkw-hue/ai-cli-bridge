@@ -97,6 +97,7 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 | `TRUST_PROXY` | 前面有几层反向代理（Render 是 1）。不设时完全不看 `X-Forwarded-For`，防止伪造 IP 绕过登录限流 |
 | `AGENT_TOKEN` | 固定 agent token（至少 24 位）；不设则自动生成并存在 `data/config.json` |
 | `ADMIN_PASSWORD` | 管理员 `admin` 的密码（至少 8 位），每次启动都以它为准；不设则第一次启动时随机生成并写进 `data/INITIAL_ADMIN.txt` |
+| `MY_ACCOUNTS` | 多个具名访客，格式为 `name:password,name:password`。使用英文逗号分隔，密码至少 8 位，可含冒号；用户名可用中文。 |
 | `GUEST1_PASSWORD` … `GUEST5_PASSWORD` | 最多 5 个访客账号的密码（至少 8 位），设了哪个就有哪个账号，删掉就停用；改了密码，已登录的设备会被踢下线 |
 | `GUEST1_NAME` … `GUEST5_NAME` | 可选，访客的用户名（默认 `guest1` … `guest5`，可以用中文） |
 | `GUEST_MAX_LEVEL` / `GUEST_DAILY_LIMIT` | 可选，访客新建时的最高权限（默认 `edit` 可改文件）和每日条数（默认 50） |
@@ -107,6 +108,8 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 2. 按 `render.yaml` 创建：新加坡机房、免费版、`node relay/server.js`。创建时会让你填 `ADMIN_PASSWORD`；`AGENT_TOKEN` 自动生成，在服务的 Environment 页能看到。
 3. 部署完成后打开 `https://<服务名>.onrender.com`，用 `admin` + 你填的密码登录。
 4. Mac 上 `agent/agent.config.json` 的 `relayUrl` 改成这个网址，`token` 填 `AGENT_TOKEN`，然后 `npm run agent`（或 `bash mac/install-mac.sh agent` 装成开机自启）。
+
+可在 Render 的 Environment 中将 `MY_ACCOUNTS` 设为例如 `小林:ExamplePassA,小陈:ExamplePassB`（示例密码请替换）。保存重启后，访客用对应名字和密码登录，页顶显示名字。调换顺序不影响账号；同名换密码开启新租期，移除条目停用账号。管理员、已有网页账号及已配置的 GUEST 账号使用各自原有的配置，请避免重名。换人时使用全新的密码。
 
 加访客账号：服务的 **Environment** 页点 Add，加 `GUEST1_PASSWORD`（需要的话再加 `GUEST1_NAME`），保存后服务会自动重启。环境变量管理的账号在网页上改不了密码、也删不掉，「用户权限」页会标出「环境变量」。
 
@@ -166,6 +169,8 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 对话列表底部的 **📁 我的文件**：浏览、下载 Mac 上自己的文件夹（`<目录>/<用户名>/`，每个对话一个子文件夹，显示成对话标题），可以在线打开图片、网页、PDF、文本，单个文件最大 25MB。普通用户只能看自己的文件夹，管理员能看所有人的；路径里的 `..`、隐藏文件、指到外面的快捷方式都会被拒绝。需要 Mac 在线。
 
 ### 会话 ID 和用量
+
+在电脑侧栏或手机 ☰ 菜单点 **找回我的对话**。在线 Mac 的执行端需为 1.2.0 或更新版本。列表只展示当前账号、当前租期且仍有权限的索引记录，按最近使用时间排序。点标题即可继续；旧索引未保存时间时会单独标明。
 
 点击对话顶部的 **ID** 即可复制。在「＋ 新对话」里输入 `id:c_0123456789ab`（换成实际 ID）并发送，即可打开原对话和历史消息。也可以输入 `id:c_0123456789ab 继续上次的修改`，或把正文写在下一行。只有正文会提交给 CLI，沿用原对话的设备、目录和上下文。
 

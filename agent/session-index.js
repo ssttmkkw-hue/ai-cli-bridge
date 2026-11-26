@@ -46,13 +46,24 @@ class SessionIndex {
     const old = this.rows[t.convId];
     if (old && (old.deleted || old.ownerKey !== t.ownerKey || old.revision > t.revision)) return;
     this.save(t.convId, { id: t.convId, ownerKey: t.ownerKey, username: t.username, cli: t.cli, level: t.level,
-      model: t.model, workspace: t.workspace, title: t.title, revision: t.revision, sessionId, dir: fs.realpathSync(dir) });
+      model: t.model, workspace: t.workspace, title: t.title, revision: t.revision, sessionId, lastUsedAt: Date.now(), dir: fs.realpathSync(dir) });
   }
   forget(pr) {
     const old = this.rows[pr.convId];
     if (!WEB_ID.test(pr.convId) || (old && old.ownerKey !== pr.ownerKey)) throw Error('对话归属不匹配');
     if (old?.deleted || old?.revision > pr.revision) return;
     this.save(pr.convId, { ownerKey: pr.ownerKey, revision: pr.revision, deleted: pr.remove, sessionId: null });
+  }
+  list(pr) {
+    const result = [];
+    for (const row of Object.values(this.rows)) {
+      if (!row.sessionId || row.ownerKey !== pr.ownerKey || row.username !== pr.username) continue;
+      if (!pr.workspaces.includes(row.workspace) || !pr.clis.includes(row.cli)) continue;
+      const ws = this.workspaces.find(w => w.name === row.workspace);
+      if (originalDirectory(ws, row.username, row.id) !== row.dir) continue;
+      result.push({ id: row.id, title: row.title, lastUsedAt: row.lastUsedAt || null });
+    }
+    return result;
   }
   async lookup(pr) {
     const row = WEB_ID.test(pr.key) ? this.rows[pr.key] : Object.values(this.rows).find(r => r.ownerKey === pr.ownerKey && r.sessionId === pr.key);
