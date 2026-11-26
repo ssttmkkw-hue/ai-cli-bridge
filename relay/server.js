@@ -223,7 +223,7 @@ function appendEvents(t, evs) {
     // 连续文本合并，减少存储条数
     const last = t.events[t.events.length - 1];
     if (e.k === 'text' && last && last.k === 'text') last.d += e.d;
-    else t.events.push(e);
+    else t.events.push({ ...e }); // 存副本：后续文本会合并进存储的这条，不能改到正要推给网页的原事件
     t.outputSize = (t.outputSize || 0) + (e.d ? e.d.length : 0);
   }
   if (t.outputSize > config.taskOutputLimit && !t.truncated) {

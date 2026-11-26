@@ -8,7 +8,7 @@
 - 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
 - Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
 - Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
-- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 21 项，全部通过。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 22 项，全部通过。
 
 ## 架构
 
@@ -67,7 +67,7 @@
 
 ```bash
 npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
-node dev/smoke-test.mjs  # 另开终端，21 项冒烟测试，不花额度
+node dev/smoke-test.mjs  # 另开终端，22 项冒烟测试，不花额度
 npm run check            # 只做语法检查
 ```
 
@@ -101,7 +101,7 @@ npm run check            # 只做语法检查
 - [ ] `brew install node`，`node -v` ≥ 18
 - [ ] `claude` 登录；`codex login`
 - [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
-- [ ] `node dev/smoke-test.mjs` 21 项全过
+- [ ] `node dev/smoke-test.mjs` 22 项全过
 - [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
 - [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
 - [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览

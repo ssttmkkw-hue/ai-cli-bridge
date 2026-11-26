@@ -54,6 +54,36 @@ const r1 = await waitTask(A, t1.id), r2 = await waitTask(A, t2.id);
 ok(r1?.status === 'done', '第一条完成');
 ok(r2?.status === 'done' && r2.resumeSessionId === r1.sessionId, '第二条续接了第一条的会话');
 
+// 1b. 实时推送的文本和最终保存的一致（工具调用后同一批多段文本曾被重复推送）
+{
+  const ctl = new AbortController();
+  const es = await fetch(B + '/api/stream', { headers: { cookie: await login('admin', pw) }, signal: ctl.signal });
+  let live = '', sseBuf = '', taskId = null;
+  const pending = [];
+  const reading = (async () => {
+    const dec = new TextDecoder();
+    try {
+      for await (const part of es.body) {
+        sseBuf += dec.decode(part, { stream: true });
+        let i;
+        while ((i = sseBuf.indexOf('\n\n')) >= 0) {
+          const block = sseBuf.slice(0, i); sseBuf = sseBuf.slice(i + 2);
+          if (!block.startsWith('event: chunk')) continue;
+          const d = JSON.parse(block.slice(block.indexOf('data: ') + 6));
+          if (taskId === null) pending.push(d); else if (d.taskId === taskId) for (const e of d.events) if (e.k === 'text') live += e.d;
+        }
+      }
+    } catch {}
+  })();
+  const ts = (await A('POST', `/api/convs/${conv.id}/send`, { prompt: '分段回复' })).j.task;
+  taskId = ts.id;
+  for (const d of pending.splice(0)) if (d.taskId === taskId) for (const e of d.events) if (e.k === 'text') live += e.d;
+  const rs = await waitTask(A, ts.id);
+  await sleep(300); ctl.abort(); await reading;
+  const stored = (rs?.events || []).filter(e => e.k === 'text').map(e => e.d).join('');
+  ok(rs?.status === 'done' && stored.includes('第4段') && live === stored, '实时推送的文本与保存的一致（不重复）', live === stored ? '' : `实时 ${live.length} 字 / 保存 ${stored.length} 字`);
+}
+
 // 2. 停止：连点 5 下只产生一条提示，且很快停下
 const t3 = (await A('POST', `/api/convs/${conv.id}/send`, { prompt: '慢一点 slow' })).j.task;
 for (let i = 0; i < 40; i++) { if ((await A('GET', '/api/tasks/' + t3.id)).j.task.status === 'running') break; await sleep(200); }

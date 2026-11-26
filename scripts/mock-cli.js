@@ -30,6 +30,8 @@ process.stdin.on('end', async () => {
   }
   const att = input.match(/\[用户附件\][\s\S]*/);
   if (att) extra += '\n\n收到附件：\n' + att[0].split('\n').slice(1).join('\n');
+  // 分段回复：工具调用之后连续多段文本，会落进 agent 的同一批上报，用来测实时推送不重复
+  if (/分段|chunks/.test(input)) for (let i = 1; i <= 4; i++) out({ type: 'item.completed', item: { type: 'agent_message', text: `第${i}段` } });
   const slow = /slow|慢/.test(input) ? 20 : 1;
   for (let i = 0; i < slow; i++) await wait(500);
   out({ type: 'item.completed', item: { type: 'agent_message', text: `（模拟回复 · 会话 ${thread.slice(0, 8)}${ri >= 0 ? ' · 续接' : ''}）\n你说的是：**${input.trim().slice(0, 200)}**\n\n\`\`\`js\nconsole.log("hello")\n\`\`\`${extra}` } });
