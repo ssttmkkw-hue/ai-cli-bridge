@@ -116,6 +116,23 @@ const fsvg = await fetch(B + '/api/files/' + svg.id, { headers: { cookie: (await
 ok(fsvg.status === 200 && fsvg.headers.get('content-security-policy')?.includes('sandbox'), 'SVG 带沙盒响应头');
 ok((await fetch(B + '/api/files/' + html.id)).status === 401, '未登录拿不到文件');
 
+// 3a. 对话备份：zip 里有离线查看页、原始数据、产出文件和附件
+{
+  const zipNames = buf => { // 读 zip 末尾的中央目录，列出所有文件名
+    const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    if (eocd < 0) return null;
+    const n = buf.readUInt16LE(eocd + 10); let p = buf.readUInt32LE(eocd + 16); const names = [];
+    for (let i = 0; i < n; i++) { const nl = buf.readUInt16LE(p + 28), el = buf.readUInt16LE(p + 30), cl = buf.readUInt16LE(p + 32); names.push(buf.slice(p + 46, p + 46 + nl).toString('utf8')); p += 46 + nl + el + cl; }
+    return names;
+  };
+  const r = await fetch(`${B}/api/convs/${conv.id}/export`, { headers: { cookie: await login('admin', pw) } });
+  const buf = Buffer.from(await r.arrayBuffer());
+  const names = (zipNames(buf) || []).map(n => n.replace(/^[^/]+\//, ''));
+  ok(r.status === 200 && r.headers.get('content-type') === 'application/zip' && ['index.html', 'data.json', 'README.txt'].every(n => names.includes(n)), '对话备份：zip 里有离线查看页和原始数据', `${names.length} 个文件`);
+  ok(['chart.svg', 'report.html', 'notes.md'].every(f => names.some(n => n.startsWith('c01/files/') && n.endsWith('/' + f) || n === 'c01/files/' + f)) && names.some(n => n.startsWith('c01/attachments/')), '对话备份：产出文件和附件都打包了');
+  ok((await fetch(`${B}/api/convs/${conv.id}/export`)).status === 401 && (await fetch(`${B}/api/export`)).status === 401, '对话备份：未登录不能下载');
+}
+
 // 3b. 并发与产出归属：产出靠「任务前后目录对比」收集，不能串到别的任务（可能是别的用户）
 //   - 开了 isolate 的目录：每个对话独立子文件夹，可以同时跑
 //   - 共用的目录：同一时间只跑一个，后来的排队

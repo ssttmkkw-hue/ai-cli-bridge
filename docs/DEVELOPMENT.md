@@ -8,7 +8,7 @@
 - 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
 - Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
 - Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
-- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 31 项，全部通过。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 34 项，全部通过。
 
 ## 架构
 
@@ -34,6 +34,7 @@
 | 掉线 | 执行端 45 秒没轮询即视为离线；已派发的任务 90 秒没有回音就判失败；中继重启时正在跑的任务判失败 |
 | 文件 | `POST /api/agent/files`（agent 上传产出）、`GET /api/agent/files/:id`（agent 取附件）、`POST /api/uploads`（用户上传，需要 `X-Upload: 1` 头防 CSRF）、`GET /api/files/:id`（只有能看到这个任务的人能访问；HTML/SVG 带 `CSP: sandbox`） |
 | 推送 | `/api/stream` SSE，事件 `task`（任务摘要，不含 events）、`chunk`（新增输出）、`agents`（设备列表） |
+| 备份导出 | `GET /api/convs/:id/export`、`GET /api/export`（`?all=1` 管理员导出所有人）→ `relay/export.js` 的 `exportConvs()`：先 `plan()` 决定每个文件在 zip 里的位置（同一任务同一路径只打包一份；回答里的「引用」不算新版本；最终版放 `files/`，被后面改掉的放 `history/t<N>/`），再用 `relay/zip.js` 的 `ZipWriter` 边读边写进响应（一次只读一个文件；文件名 UTF-8 标记 + 0x7075 扩展字段；我们自己起的目录名只用英文）。`index.html` 把 `style.css`、`render.js`、`export-viewer.js` 和数据内嵌进去 |
 
 ### agent/agent.js（执行端）
 | 部分 | 说明 |
@@ -49,7 +50,9 @@
 | 附件 | `prepareInputs()` 下载到 `<任务目录>/.ai-bridge/uploads/<任务id>/`，把相对路径追加到 prompt |
 | 停止 | `job.cancel()` 是幂等的；`killTree()`：Windows 用 `taskkill /T /F`，Mac 结束整个进程组；进程退出但 `close` 迟迟不来时有兜底 |
 
-### web/app.js（前端）
+### web/（前端）
+- `render.js`：网页版和离线备份查看页共用的渲染函数（`md`、`eventsHTML`、`outputsHTML`、`inputsHTML`、`diffHTML`…）。`fileUrl` 用 `let` 声明，离线页把它换成 zip 里的相对路径；`isDevInfo()` 认出开发用的提示（新记录 `dev: true`，旧记录按内容）。
+- `export-viewer.js`：离线备份查看页（备份 zip 里的 index.html）。
 - 状态都在全局 `S` 里；`render()` 画外框，`renderView()` 画当前页。
 - 新对话不弹窗：没选中对话时，聊天区顶部是 `renderNewChat()`（设备状态 + CLI / 模型单选按钮，`S.draft` 记当前选择），发第一条消息（或先加附件）时 `ensureConv()` 才创建对话；目录取设备上第一个 `isolate` 目录，权限取 `allowedLevels()` 的最高一级。Claude 的 3 个模型写死在 `CLAUDE_MODELS`，Codex 的取 agent 配置 `clis.codex.models` 前 3 个。手机上一打开先展开历史列表。
 - 流式输出只重画对应的那一条回答（`renderTurn`），不动输入框。
@@ -71,7 +74,7 @@
 
 ```bash
 npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
-node dev/smoke-test.mjs  # 另开终端，31 项冒烟测试，不花额度
+node dev/smoke-test.mjs  # 另开终端，34 项冒烟测试，不花额度
 npm run check            # 只做语法检查
 ```
 
@@ -106,7 +109,7 @@ npm run check            # 只做语法检查
 - [ ] `brew install node`，`node -v` ≥ 18
 - [ ] `claude` 登录；`codex login`
 - [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
-- [ ] `node dev/smoke-test.mjs` 31 项全过
+- [ ] `node dev/smoke-test.mjs` 34 项全过
 - [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
 - [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
 - [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览

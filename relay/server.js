@@ -6,6 +6,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { exportConvs } = require('./export');
 
 const ROOT = path.resolve(__dirname, '..');
 const WEB_DIR = path.join(ROOT, 'web');
@@ -535,6 +536,24 @@ async function handle(req, res) {
     const out = { agents: visibleAgents(user) };
     if (isAdmin) out.agentToken = config.agentToken;
     return send(res, 200, out);
+  }
+
+  // ===== 备份导出（zip，边生成边下载）：一个对话，或我的全部对话（管理员加 ?all=1 导出所有人的）=====
+  const exportMm = p.match(/^\/api\/convs\/([\w-]+)\/export$/);
+  if (m === 'GET' && (exportMm || p === '/api/export')) {
+    let convs, title;
+    if (exportMm) {
+      const c = db.convs.find(x => x.id === exportMm[1]);
+      if (!c || (!isAdmin && c.userId !== user.id)) fail(404, '对话不存在');
+      convs = [c]; title = c.title;
+    } else {
+      convs = db.convs.filter(c => (isAdmin && url.searchParams.get('all')) || c.userId === user.id).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      if (!convs.length) fail(404, '还没有对话');
+      title = '全部对话';
+    }
+    try { await exportConvs(res, { convs, title, blobPath, tasksOf: c => db.tasks.filter(t => t.convId === c.id) }); }
+    catch (e) { console.error('[relay] 导出失败', e); res.destroy(); } // 响应头已经发出，只能断开
+    return;
   }
 
   // ===== 对话 =====

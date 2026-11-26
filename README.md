@@ -25,11 +25,12 @@ agent 是**主动连出去**领任务的，所以 Mac 放在家里路由器后�
 | `relay/server.js` | 中继：网页、登录、用户权限、对话与任务队列、SSE 推送、agent 接口 |
 | `agent/agent.js` | 执行端：找 CLI、领任务、调用 CLI、把流式输出解析成统一事件回传 |
 | `agent/agent.config.example.json` | agent 配置模板（设备名、工作目录、各目录最高权限） |
-| `web/` | 前端（原生 JS，无构建）：对话 / 任务 / 设备 / 用户权限 四个页面，手机可用 |
+| `web/` | 前端（原生 JS，无构建）：对话 / 任务 / 设备 / 用户权限 四个页面，手机可用；`render.js` 是网页版和离线备份共用的渲染函数 |
+| `relay/export.js`、`relay/zip.js` | 对话备份：边生成边下载的 zip（零依赖） |
 | `mac/install-mac.sh` | 在 Mac 上装成开机自启服务（launchd） |
 | `scripts/start-local.js` | 本地联调：一条命令同时起中继 + agent |
 | `scripts/mock-cli.js` | 假 CLI，不花额度测试整条链路 |
-| `dev/smoke-test.mjs` | 冒烟测试（31 项，只用假 CLI） |
+| `dev/smoke-test.mjs` | 冒烟测试（34 项，只用假 CLI） |
 | `docs/DEVELOPMENT.md` | 开发交接：代码地图、已知问题、下一步计划、Mac 验证清单 |
 | `data/` | 运行后生成：`config.json`（agent token）、`users.json`、`db.json`、`sessions.json`（登录会话）、`files/`（产出与附件）、`INITIAL_ADMIN.txt` |
 
@@ -41,7 +42,7 @@ npm run local        # 等同于 node scripts/start-local.js 5227
 
 打开 http://localhost:5227 ，管理员账号 `admin`，初始密码在 `data/INITIAL_ADMIN.txt`。
 本地联调会自动生成 `agent/agent.local.json`，带一个「模拟 CLI」和两个测试目录（`test-workspaces/sandbox` 可写、`test-workspaces/readonly` 只读）。
-另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 31 项功能，不花额度。
+另开一个终端跑 `node dev/smoke-test.mjs` 可以自动检查 34 项功能，不花额度。
 
 ## 二、部署到 Mac Air
 
@@ -148,6 +149,16 @@ Mac 上只跑 agent：`bash mac/install-mac.sh agent`，`agent.config.json` 里 
 
 已有对话所在的目录改成 `isolate` 后，它的工作目录会变成新的子文件夹；Claude Code 的会话按目录保存，所以这类对话的下一条消息会自动开新会话。
 对话设置里可以「清空上下文」，下一条消息开新会话。
+
+### 对话备份
+
+对话标题右边的 **⬇** 下载这个对话的备份，对话列表底部的 **⬇ 备份全部对话** 下载所有对话（管理员访问 `/api/export?all=1` 可导出所有人的）。下载的是一个 zip：
+
+- 解压后双击 `index.html`，用浏览器离线查看：样子和网页版一样，不用联网、不用登录；回答里的图片、链接和产出文件卡片点开就是 zip 里的文件
+- `c01/files/`：每个产出文件的最终版本，保持 AI 生成时的目录结构（AI 做的网页可以直接双击打开）；`c01/history/`：被后面的消息改掉的旧版本；`c01/attachments/`：上传的附件
+- `data.json`：原始数据
+
+Render 免费版重启 / 重新部署会清空对话记录，重要的对话记得先备份。
 
 ## 五、文件与图片
 
