@@ -1,0 +1,14 @@
+{
+  "name": "ai-cli-bridge",
+  "version": "0.3.0",
+  "description": "AI 遥控台：用网页（含手机）调用闲置电脑上已登录的 Claude Code / Codex CLI",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "local": "node scripts/start-local.js 5227",
+    "relay": "node relay/server.js",
+    "agent": "node agent/agent.js agent/agent.config.json",
+    "check": "node --check relay/server.js && node --check agent/agent.js && node --check web/app.js && node --check scripts/mock-cli.js && node --check scripts/start-local.js"
+  }
+}

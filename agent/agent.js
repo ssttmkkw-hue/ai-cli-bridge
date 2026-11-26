@@ -1,0 +1,564 @@
+// 执行端（Agent）：跑在闲置的 Mac Air 上，主动连中继领任务，调用本机 claude / codex CLI。
+// 零依赖，Node 18+。用法：node agent/agent.js [配置文件路径]
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn, execFileSync } = require('child_process');
+
+const VERSION = '1.0.0';
+const cfgPath = path.resolve(process.argv[2] || process.env.AGENT_CONFIG || path.join(__dirname, 'agent.config.json'));
+if (!fs.existsSync(cfgPath)) {
+  console.error(`[agent] 找不到配置 ${cfgPath}，请复制 agent.config.example.json 改一份`);
+  process.exit(1);
+}
+const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+cfg.relayUrl = (process.env.RELAY_URL || cfg.relayUrl || 'http://127.0.0.1:5227').replace(/\/$/, '');
+cfg.token = process.env.AGENT_TOKEN || cfg.token;
+cfg.name ||= os.hostname();
+cfg.maxConcurrent ||= 2;
+cfg.taskTimeoutMin ||= 30;
+const IS_WIN = process.platform === 'win32';
+const expandHome = p => p && p.replace(/^~(?=$|[\\/])/, os.homedir());
+
+if (!cfg.token || /粘贴|paste/i.test(cfg.token)) {
+  cfg.token = '';
+  // 中继和 agent 在同一台机器上时：直接从中继的数据目录读 token
+  try { cfg.token = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'config.json'), 'utf8')).agentToken; } catch {}
+}
+if (!cfg.token) { console.error('[agent] 缺少 token'); process.exit(1); }
+
+// ---------------------------------------------------------------- 找 CLI
+function newestChild(dir, file) {
+  // 在 dir/<版本或哈希>/.../file 里找最新的一个（Windows 上的 Claude/Codex 安装目录形态）
+  try {
+    const hits = [];
+    const walk = (d, depth) => {
+      if (depth < 0) return;
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const f = path.join(d, e.name);
+        if (e.isDirectory()) walk(f, depth - 1);
+        else if (e.name === file) hits.push({ f, t: fs.statSync(f).mtimeMs });
+      }
+    };
+    walk(dir, 5);
+    return hits.sort((a, b) => b.t - a.t)[0]?.f || null;
+  } catch { return null; }
+}
+function which(cmd) {
+  try {
+    const out = execFileSync(IS_WIN ? 'where' : '/bin/sh', IS_WIN ? [cmd] : ['-lc', `command -v ${cmd}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const lines = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    // Windows 上只要 .exe，.cmd 需要 shell，容易出转义问题
+    return (IS_WIN ? lines.find(l => l.toLowerCase().endsWith('.exe')) : lines[0]) || null;
+  } catch { return null; }
+}
+function findBin(kind) {
+  const home = os.homedir();
+  const candidates = [];
+  if (IS_WIN) {
+    const la = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    if (kind === 'codex') candidates.push(newestChild(path.join(la, 'OpenAI', 'Codex', 'bin'), 'codex.exe'));
+    if (kind === 'claude') {
+      candidates.push(path.join(home, '.local', 'bin', 'claude.exe'));
+      candidates.push(newestChild(path.join(la, 'Claude-Data'), 'claude.exe'));
+    }
+  } else {
+    candidates.push(
+      path.join(home, '.local', 'bin', kind),
+      path.join(home, '.claude', 'local', kind),
+      `/opt/homebrew/bin/${kind}`, `/usr/local/bin/${kind}`,
+      path.join(home, '.npm-global', 'bin', kind),
+      '/Applications/Codex.app/Contents/Resources/codex',
+    );
+  }
+  candidates.unshift(which(kind));
+  return candidates.find(f => f && fs.existsSync(f)) || null;
+}
+function versionOf(bin) {
+  try { return execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 15000, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] }).trim().split('\n')[0]; }
+  catch (e) { return null; }
+}
+
+// 子进程环境：去掉宿主 Claude Code 注入的变量，避免嵌套调用时继承宿主身份/配置
+function childEnv() {
+  const env = { ...process.env };
+  const nested = !!env.CLAUDE_CODE_SESSION_ID || !!env.CLAUDECODE;
+  for (const k of Object.keys(env)) {
+    if (k === 'CLAUDECODE' || k.startsWith('CLAUDE_CODE_') || k.startsWith('CLAUDE_AGENT_SDK') || k === 'CLAUDE_PID') delete env[k];
+    if (nested && k === 'ANTHROPIC_BASE_URL') delete env[k];
+  }
+  // launchd 启动时 PATH 很短，补上常见路径，CLI 内部调用 git/node 才找得到
+  if (!IS_WIN) env.PATH = [env.PATH, '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', path.join(os.homedir(), '.local', 'bin')].filter(Boolean).join(':');
+  return env;
+}
+
+// ---------------------------------------------------------------- 文件：快照 / 对比 / 类型
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', '.next', '.cache', '.ai-bridge', '.DS_Store', '.idea', '.vscode', 'Pods', '.gradle', 'target']);
+const MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif',
+  html: 'text/html', htm: 'text/html', css: 'text/css', js: 'text/javascript', mjs: 'text/javascript', ts: 'text/plain', tsx: 'text/plain', jsx: 'text/plain',
+  json: 'application/json', md: 'text/markdown', txt: 'text/plain', csv: 'text/csv', tsv: 'text/tab-separated-values', xml: 'application/xml', yaml: 'text/plain', yml: 'text/plain', toml: 'text/plain',
+  py: 'text/plain', sh: 'text/plain', go: 'text/plain', rs: 'text/plain', java: 'text/plain', kt: 'text/plain', swift: 'text/plain', c: 'text/plain', h: 'text/plain', cpp: 'text/plain', cs: 'text/plain', rb: 'text/plain', php: 'text/plain', sql: 'text/plain', vue: 'text/plain', svelte: 'text/plain', log: 'text/plain', ini: 'text/plain', env: 'text/plain',
+  pdf: 'application/pdf', zip: 'application/zip', mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', ogg: 'audio/ogg', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+};
+const extOf = f => path.extname(f).slice(1).toLowerCase();
+const mimeOf = f => MIME[extOf(f)] || 'application/octet-stream';
+const isTextFile = f => { const m = mimeOf(f); return m.startsWith('text/') || /json|xml|svg/.test(m) || ['gitignore', 'dockerfile', 'makefile'].includes(path.basename(f).toLowerCase()); };
+const SNAP_MAX_FILES = 20000, SNAP_TEXT_MAX = 200 * 1024, SNAP_TEXT_TOTAL = 20 * 1024 * 1024;
+const MAX_UPLOAD = 25 * 1024 * 1024, MAX_UPLOAD_FILES = 30, MAX_UPLOAD_TOTAL = 100 * 1024 * 1024;
+
+function snapshot(root) {
+  const files = new Map(); let textBytes = 0, partial = false;
+  const walk = (dir, depth) => {
+    if (depth > 12 || partial) return;
+    let ents; try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      if (files.size >= SNAP_MAX_FILES) { partial = true; return; }
+      if (SKIP_DIRS.has(e.name)) continue;
+      const f = path.join(dir, e.name);
+      if (e.isDirectory()) walk(f, depth + 1);
+      else if (e.isFile()) {
+        let st; try { st = fs.statSync(f); } catch { continue; }
+        const rec = { mtime: st.mtimeMs, size: st.size };
+        if (st.size <= SNAP_TEXT_MAX && textBytes + st.size <= SNAP_TEXT_TOTAL && isTextFile(f)) {
+          try { rec.text = fs.readFileSync(f, 'utf8'); textBytes += st.size; } catch {}
+        }
+        files.set(f, rec);
+      }
+    }
+  };
+  walk(root, 0);
+  return { files, partial };
+}
+
+// 行级 diff（去掉首尾相同部分后做 LCS），输出带 3 行上下文的统一格式
+function lineDiff(a, b) {
+  const A = a.split('\n'), B = b.split('\n');
+  let s = 0; while (s < A.length && s < B.length && A[s] === B[s]) s++;
+  let ea = A.length, eb = B.length; while (ea > s && eb > s && A[ea - 1] === B[eb - 1]) { ea--; eb--; }
+  const a2 = A.slice(s, ea), b2 = B.slice(s, eb), n = a2.length, m = b2.length;
+  let ops = [];
+  if (n * m > 4e6) return { text: null, add: m, del: n };
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = a2[i] === b2[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  let i = 0, j = 0;
+  while (i < n && j < m) { if (a2[i] === b2[j]) { ops.push([' ', a2[i], s + i, s + j]); i++; j++; } else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push(['-', a2[i], s + i]); i++; } else { ops.push(['+', b2[j], null, s + j]); j++; } }
+  while (i < n) { ops.push(['-', a2[i], s + i]); i++; }
+  while (j < m) { ops.push(['+', b2[j], null, s + j]); j++; }
+  // 加上前后各 3 行上下文
+  const pre = A.slice(Math.max(0, s - 3), s).map((l, k) => [' ', l]);
+  const post = A.slice(ea, ea + 3).map(l => [' ', l]);
+  ops = [...pre, ...ops, ...post];
+  // 中间连续超过 6 行的相同内容折叠
+  const out = []; let run = [];
+  const flushRun = last => {
+    if (run.length > 6 && !last) { out.push(...run.slice(0, 3), ['@', `… 省略 ${run.length - 6} 行相同内容 …`], ...run.slice(-3)); }
+    else out.push(...run);
+    run = [];
+  };
+  for (const o of ops) { if (o[0] === ' ') run.push(o); else { flushRun(); out.push(o); } }
+  flushRun(true);
+  const add = ops.filter(o => o[0] === '+').length, del = ops.filter(o => o[0] === '-').length;
+  let text = `@@ 第 ${Math.max(0, s - 3) + 1} 行起 @@\n` + out.map(o => o[0] === '@' ? '@@ ' + o[1] + ' @@' : o[0] + o[1]).join('\n');
+  if (text.length > 60000) text = text.slice(0, 60000) + '\n…（对比过长，已截断）';
+  return { text, add, del };
+}
+
+function diffSnapshots(before, after) {
+  const changes = [];
+  for (const [f, r] of after.files) {
+    const old = before.files.get(f);
+    if (!old) changes.push({ abs: f, change: 'add', rec: r });
+    else if (old.mtime !== r.mtime || old.size !== r.size) {
+      if (old.text != null && r.text != null && old.text === r.text) continue; // 只碰了时间戳
+      changes.push({ abs: f, change: 'modify', rec: r, old });
+    }
+  }
+  if (!before.partial && !after.partial) for (const f of before.files.keys()) if (!after.files.has(f)) changes.push({ abs: f, change: 'delete' });
+  return changes;
+}
+
+async function uploadFile(taskId, abs) {
+  const buf = fs.readFileSync(abs);
+  const r = await fetch(cfg.relayUrl + '/api/agent/files', {
+    method: 'POST', body: buf,
+    headers: { Authorization: 'Bearer ' + cfg.token, 'Content-Type': 'application/octet-stream', 'X-Task': taskId },
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j.id;
+}
+async function downloadInput(f, dest) {
+  const r = await fetch(cfg.relayUrl + '/api/agent/files/' + encodeURIComponent(f.id), { headers: { Authorization: 'Bearer ' + cfg.token } });
+  if (!r.ok) throw new Error('附件下载失败：' + f.name);
+  fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+}
+
+// 回答里用 Markdown 引用的本地文件：![](./chart.png) / [报告](/Users/x/out.pdf) / file:///...
+function localLinks(text) {
+  const out = new Set();
+  const re = /!?\[[^\]\n]*\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)/g; let m;
+  while ((m = re.exec(text))) {
+    const raw = m[1];
+    if (/^(https?:|data:|mailto:|#)/i.test(raw)) continue;
+    out.add(raw);
+  }
+  return [...out];
+}
+function resolveLocal(raw, wsPath) {
+  let p = raw;
+  try { p = decodeURIComponent(p); } catch {}
+  p = p.replace(/^file:\/\//i, '');
+  if (IS_WIN && /^\/[a-zA-Z]:/.test(p)) p = p.slice(1);
+  p = p.replace(/#.*$/, '').replace(/:\d+(:\d+)?$/, ''); // 去掉 #锚点 和 :行号
+  p = expandHome(p);
+  return path.isAbsolute(p) ? path.resolve(p) : path.resolve(wsPath, p);
+}
+const inside = (child, parent) => { const r = path.relative(parent, child); return r && !r.startsWith('..') && !path.isAbsolute(r); };
+const extraOutputDirs = (cfg.extraOutputDirs || ['~/.codex/generated_images']).map(d => path.resolve(expandHome(d)));
+
+const clis = {};
+for (const [kind, c] of Object.entries(cfg.clis || { claude: {}, codex: {} })) {
+  if (c.enabled === false) continue;
+  if (kind === 'mock') {
+    clis.mock = { ok: true, bin: process.execPath, prefixArgs: [path.join(__dirname, '..', 'scripts', 'mock-cli.js')], version: 'mock' };
+    continue;
+  }
+  const bin = c.bin && c.bin !== 'auto' ? expandHome(c.bin) : findBin(kind);
+  const version = bin ? versionOf(bin) : null;
+  clis[kind] = { ok: !!(bin && version), bin, version, models: c.models || [], prefixArgs: [] };
+}
+
+const workspaces = (cfg.workspaces || []).map(w => ({ name: w.name, path: path.resolve(expandHome(w.path)), maxLevel: w.maxLevel || 'full', note: w.note || '' }));
+for (const w of workspaces) if (!fs.existsSync(w.path)) { fs.mkdirSync(w.path, { recursive: true }); console.log(`[agent] 已创建工作目录 ${w.path}`); }
+if (!workspaces.length) { console.error('[agent] 至少配置一个 workspaces'); process.exit(1); }
+
+console.log(`[agent] ${cfg.name} → ${cfg.relayUrl}`);
+for (const [k, c] of Object.entries(clis)) console.log(`[agent]   ${k}: ${c.ok ? '✓ ' + c.version : '✗ 未找到或无法运行'}  ${c.bin || ''}`);
+
+// ---------------------------------------------------------------- 与中继通信
+async function api(method, p, body, signal) {
+  const r = await fetch(cfg.relayUrl + p, {
+    method, signal,
+    headers: { Authorization: 'Bearer ' + cfg.token, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(j.error || r.statusText); e.status = r.status; throw e; }
+  return j;
+}
+
+const running = new Map(); // taskId -> job
+const recentlyFinished = new Set(); // 刚结束的任务，结果可能还在上报途中
+const pending = new Map(); // taskId -> { events:[], status, sessionId, usage, final }
+let flushTimer = null;
+function queueUpdate(taskId, patch) {
+  const u = pending.get(taskId) || { taskId, events: [] };
+  if (patch.events) u.events.push(...patch.events);
+  for (const k of ['status', 'sessionId', 'usage', 'final', 'outputs', 'linkMap']) if (patch[k] !== undefined) u[k] = patch[k];
+  pending.set(taskId, u);
+  if (!flushTimer) flushTimer = setTimeout(flush, patch.final ? 0 : 150);
+}
+async function flush() {
+  flushTimer = null;
+  if (!pending.size) return;
+  const updates = [...pending.values()]; pending.clear();
+  for (let i = 0; i < 5; i++) {
+    try { await api('POST', '/api/agent/events', { agent: cfg.name, updates }); return; }
+    catch (e) { await sleep(1000 * (i + 1)); }
+  }
+  console.error('[agent] 上报失败，丢弃', updates.length, '条更新');
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function hello() {
+  await api('POST', '/api/agent/hello', {
+    name: cfg.name, platform: process.platform, hostname: os.hostname(), version: VERSION,
+    maxConcurrent: cfg.maxConcurrent, running: [...running.keys()],
+    clis: Object.fromEntries(Object.entries(clis).map(([k, c]) => [k, { ok: c.ok, version: c.version, models: c.models }])),
+    workspaces: workspaces.map(({ name, maxLevel, note }) => ({ name, maxLevel, note })),
+  });
+}
+
+let pollAbort = null;
+async function loop() {
+  let backoff = 1000, greeted = false;
+  for (;;) {
+    try {
+      if (!greeted) { await hello(); greeted = true; backoff = 1000; console.log('[agent] 已连上中继'); }
+      pollAbort = new AbortController();
+      const free = cfg.maxConcurrent - running.size;
+      const r = await api('GET', `/api/agent/poll?name=${encodeURIComponent(cfg.name)}&free=${free}`, null, pollAbort.signal);
+      for (const id of r.cancel || []) {
+        const job = running.get(id);
+        if (job) job.cancel();
+        // 本机没在跑这个任务（例如 agent 重启过）：直接回报已取消，免得中继一直等
+        else if (!recentlyFinished.has(id)) queueUpdate(id, { final: { status: 'cancelled', error: '已停止（执行端上没有在运行）' } });
+      }
+      for (const t of r.tasks || []) startTask(t);
+    } catch (e) {
+      if (e.name === 'AbortError') continue; // 有空位了，立刻重新领任务
+      if (e.status === 409 || e.status === 401) greeted = false;
+      if (e.status === 401) console.error('[agent] token 被拒绝，检查配置');
+      else console.error('[agent] 连接中继失败：', e.message);
+      await sleep(backoff); backoff = Math.min(backoff * 2, 30000); greeted = false;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 构造命令行
+// 权限三档 read / edit / full 映射到各家 CLI 的参数
+function buildCommand(t) {
+  const c = clis[t.cli];
+  if (!c || !c.ok) throw new Error(`本机 ${t.cli} 不可用`);
+  const args = [...c.prefixArgs];
+  if (t.cli === 'claude') {
+    const mode = { read: 'default', edit: 'acceptEdits', full: 'bypassPermissions' }[t.level] || 'default';
+    args.push('-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', mode);
+    if (t.model) args.push('--model', t.model);
+    if (t.resumeSessionId) args.push('--resume', t.resumeSessionId);
+    // prompt 走 stdin，避免命令行转义和长度问题
+  } else if (t.cli === 'codex') {
+    const sandbox = { read: 'read-only', edit: 'workspace-write', full: null }[t.level];
+    args.push('exec');
+    if (t.resumeSessionId) args.push('resume');
+    for (const img of t.imagePaths || []) args.push('-i', img); // 图片附件直接给模型看
+    args.push('--json', '--skip-git-repo-check');
+    if (sandbox) args.push('-c', `sandbox_mode="${sandbox}"`, '-c', 'approval_policy="never"');
+    else args.push('--dangerously-bypass-approvals-and-sandbox');
+    if (t.model) args.push('-m', t.model);
+    if (t.resumeSessionId) args.push(t.resumeSessionId);
+    args.push('-'); // 从 stdin 读 prompt
+  } else if (t.cli === 'mock') {
+    if (t.resumeSessionId) args.push('--resume', t.resumeSessionId);
+  } else throw new Error('未知 CLI ' + t.cli);
+  return { bin: c.bin, args };
+}
+
+// ---------------------------------------------------------------- 解析输出 → 统一事件
+// 统一事件：{k:'text',d} 正文增量 / {k:'tool',name,d} 工具调用 / {k:'tool_out',d} 工具结果 / {k:'info',d} / {k:'err',d}
+function short(s, n = 400) { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + '…' : s; }
+function toolDetail(name, input) {
+  if (!input) return '';
+  return input.command || input.file_path || input.path || input.pattern || input.url || input.query || input.description || short(JSON.stringify(input), 200);
+}
+function makeParser(kind, emit) {
+  const st = { textFromDelta: false, result: '', sessionId: null, isError: false, errorMsg: null };
+  if (kind === 'claude') {
+    return {
+      st,
+      line(o) {
+        if (o.type === 'system' && o.subtype === 'init') { st.sessionId = o.session_id; emit({ sessionId: o.session_id }); emit({ events: [{ k: 'info', d: `模型 ${o.model || ''} · 目录 ${o.cwd}` }] }); }
+        else if (o.type === 'stream_event') {
+          const ev = o.event;
+          if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta') { st.textFromDelta = true; emit({ events: [{ k: 'text', d: ev.delta.text }] }); }
+          if (ev?.type === 'message_start') st.textFromDelta = false;
+        } else if (o.type === 'assistant') {
+          for (const b of o.message?.content || []) {
+            if (b.type === 'text' && !st.textFromDelta && b.text) emit({ events: [{ k: 'text', d: b.text }] });
+            if (b.type === 'tool_use') emit({ events: [{ k: 'tool', name: b.name, d: short(toolDetail(b.name, b.input), 300) }] });
+          }
+          // 分隔多轮文本
+          if (st.textFromDelta) emit({ events: [{ k: 'text', d: '\n\n' }] });
+          st.textFromDelta = false;
+        } else if (o.type === 'user') {
+          for (const b of o.message?.content || []) {
+            if (b.type === 'tool_result') {
+              const txt = Array.isArray(b.content) ? b.content.map(x => x.text || '').join('') : b.content;
+              emit({ events: [{ k: 'tool_out', d: short(txt, 600), err: !!b.is_error }] });
+            }
+          }
+        } else if (o.type === 'result') {
+          st.result = o.result || '';
+          st.isError = !!o.is_error;
+          if (o.is_error) st.errorMsg = o.result || o.subtype;
+          if (o.permission_denials?.length) emit({ events: [{ k: 'info', d: `有 ${o.permission_denials.length} 个操作因权限级别被拒绝（${[...new Set(o.permission_denials.map(x => x.tool_name))].join(', ')}）` }] });
+          emit({ usage: { cost: o.total_cost_usd, turns: o.num_turns, ms: o.duration_ms, in: o.usage?.input_tokens, out: o.usage?.output_tokens } });
+        }
+      },
+    };
+  }
+  if (kind === 'codex' || kind === 'mock') {
+    return {
+      st,
+      line(o) {
+        if (o.type === 'thread.started') { st.sessionId = o.thread_id; emit({ sessionId: o.thread_id }); }
+        else if (o.type === 'item.started' && o.item?.type === 'command_execution') emit({ events: [{ k: 'tool', name: 'shell', d: short(o.item.command, 300) }] });
+        else if (o.type === 'item.completed') {
+          const it = o.item || {};
+          if (it.type === 'agent_message') { st.result = it.text || ''; emit({ events: [{ k: 'text', d: (it.text || '') + '\n\n' }] }); }
+          else if (it.type === 'reasoning') emit({ events: [{ k: 'think', d: short(it.text, 1000) }] });
+          else if (it.type === 'command_execution') emit({ events: [{ k: 'tool_out', d: short(it.aggregated_output, 600), err: it.exit_code !== 0 && it.exit_code != null }] });
+          else if (it.type === 'file_change') emit({ events: [{ k: 'tool', name: 'edit', d: (it.changes || []).map(c => `${c.kind} ${c.path}`).join('\n') }] });
+          else if (it.type === 'mcp_tool_call') emit({ events: [{ k: 'tool', name: `${it.server}.${it.tool}`, d: '' }] });
+          else if (it.type === 'web_search') emit({ events: [{ k: 'tool', name: 'web_search', d: it.query || '' }] });
+          else if (it.type === 'error') emit({ events: [{ k: 'err', d: it.message }] });
+        } else if (o.type === 'turn.completed') {
+          emit({ usage: { in: o.usage?.input_tokens, out: o.usage?.output_tokens, cached: o.usage?.cached_input_tokens } });
+        } else if (o.type === 'turn.failed') { st.isError = true; st.errorMsg = o.error?.message || '执行失败'; }
+        else if (o.type === 'error') { st.isError = true; st.errorMsg = o.message; }
+      },
+    };
+  }
+}
+
+// ---------------------------------------------------------------- 执行任务
+function killTree(child) {
+  if (!child || child.exitCode !== null) return;
+  if (IS_WIN) { try { execFileSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); } catch {} }
+  else { try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch {} } setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 5000); }
+}
+
+// 准备附件：下载到 <工作目录>/.ai-bridge/uploads/<任务id>/，把路径告诉 CLI
+async function prepareInputs(t, ws, emit) {
+  if (!t.inputs?.length) return t.prompt;
+  const dir = path.join(ws.path, '.ai-bridge', 'uploads', t.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const rels = []; t.imagePaths = [];
+  for (const f of t.inputs) {
+    let name = path.basename(f.name).replace(/[\\/:*?"<>|]/g, '_') || 'file';
+    while (fs.existsSync(path.join(dir, name))) name = '_' + name;
+    const abs = path.join(dir, name);
+    await downloadInput(f, abs);
+    rels.push(path.relative(ws.path, abs).split(path.sep).join('/'));
+    if (/^image\/(png|jpe?g|gif|webp)$/.test(f.mime || mimeOf(abs))) t.imagePaths.push(abs);
+  }
+  emit({ events: [{ k: 'info', d: `已接收 ${rels.length} 个附件` }] });
+  return `${t.prompt || '请查看附件。'}\n\n[用户附件] 已保存在当前工作目录下：\n${rels.map(r => '- ' + r).join('\n')}`;
+}
+
+// 任务结束后：找出新增/修改/删除的文件 + 回答里引用的本地文件，上传给中继
+async function collectOutputs(t, ws, before, answerText) {
+  const outputs = [], linkMap = {}, byAbs = new Map();
+  let uploadedCount = 0, uploadedBytes = 0;
+  const tryUpload = async (abs, size) => {
+    if (size > MAX_UPLOAD) return { note: '文件超过 25MB，未上传' };
+    if (uploadedCount >= MAX_UPLOAD_FILES || uploadedBytes + size > MAX_UPLOAD_TOTAL) return { note: '本次产出文件太多，未上传' };
+    try { const id = await uploadFile(t.id, abs); uploadedCount++; uploadedBytes += size; return { id }; }
+    catch (e) { return { note: '上传失败：' + e.message }; }
+  };
+  const after = snapshot(ws.path);
+  const changes = diffSnapshots(before, after);
+  // 图片和网页优先，其次按大小
+  const rank = c => (/^image\//.test(mimeOf(c.abs)) ? 0 : /html|pdf/.test(mimeOf(c.abs)) ? 1 : 2);
+  changes.sort((a, b) => rank(a) - rank(b) || (a.rec?.size || 0) - (b.rec?.size || 0));
+  for (const c of changes) {
+    const rel = path.relative(ws.path, c.abs).split(path.sep).join('/');
+    const meta = { path: rel, name: path.basename(c.abs), mime: mimeOf(c.abs), size: c.rec?.size || 0, change: c.change };
+    if (c.change === 'modify' && c.old?.text != null && c.rec.text != null) {
+      const d = lineDiff(c.old.text, c.rec.text);
+      meta.diff = d.text || undefined; meta.diffStat = { add: d.add, del: d.del };
+      if (!d.text) meta.note = '改动太大，不显示对比';
+    } else if (c.change === 'add' && c.rec?.text != null) {
+      meta.diffStat = { add: c.rec.text.split('\n').length, del: 0 };
+    }
+    if (c.change !== 'delete') Object.assign(meta, await tryUpload(c.abs, meta.size));
+    outputs.push(meta); byAbs.set(c.abs, meta);
+  }
+  // 回答里引用的本地文件（可能没改动，或在允许的额外目录里，例如 Codex 生成的图片）
+  for (const raw of localLinks(answerText)) {
+    const abs = resolveLocal(raw, ws.path);
+    if (!(inside(abs, ws.path) || extraOutputDirs.some(d => inside(abs, d)))) continue;
+    let meta = byAbs.get(abs);
+    if (!meta) {
+      let st; try { st = fs.statSync(abs); } catch { continue; }
+      if (!st.isFile()) continue;
+      const rel = inside(abs, ws.path) ? path.relative(ws.path, abs).split(path.sep).join('/') : path.basename(abs);
+      meta = { path: rel, name: path.basename(abs), mime: mimeOf(abs), size: st.size, change: 'ref', note: '回答中引用，本次未改动', ...(await tryUpload(abs, st.size)) };
+      outputs.push(meta); byAbs.set(abs, meta);
+    }
+    if (meta.id) linkMap[raw] = meta.id;
+  }
+  return { outputs, linkMap, partial: after.partial };
+}
+
+async function startTask(t) {
+  const emit = patch => queueUpdate(t.id, patch);
+  const ws = workspaces.find(w => w.name === t.workspace);
+  let ended = false;
+  const finish = final => {
+    if (ended) return; ended = true; running.delete(t.id);
+    recentlyFinished.add(t.id); setTimeout(() => recentlyFinished.delete(t.id), 120000);
+    queueUpdate(t.id, { final }); pollAbort?.abort();
+  };
+  let cancelled = false, timedOut = false, child = null;
+  const job = {
+    cancel() {
+      // 幂等：只提示一次；重复收到只是再补一刀
+      if (!cancelled) { cancelled = true; console.log(`[agent] ✕ ${new Date().toISOString().slice(11, 23)} 收到停止 ${t.id}`); emit({ events: [{ k: 'info', d: '正在停止…' }] }); }
+      if (child) killTree(child);
+    },
+  };
+  running.set(t.id, job); // 先占位，保证并发计数准确
+  emit({ status: 'running' });
+
+  let cmd, prompt, before;
+  try {
+    if (!ws) throw new Error('工作目录不存在：' + t.workspace);
+    const lv = ['read', 'edit', 'full'];
+    if (lv.indexOf(t.level) > lv.indexOf(ws.maxLevel)) throw new Error('该目录不允许此权限级别');
+    prompt = await prepareInputs(t, ws, emit);
+    cmd = buildCommand(t);
+    before = snapshot(ws.path);
+  } catch (e) { return finish({ status: 'failed', error: e.message }); }
+  if (cancelled) return finish({ status: 'cancelled', error: '已手动停止' });
+
+  console.log(`[agent] ▶ ${t.id} ${t.cli}/${t.level} @${ws.name}${t.resumeSessionId ? ' (续接)' : ''}${t.inputs?.length ? ` +${t.inputs.length}附件` : ''}`);
+  child = spawn(cmd.bin, cmd.args, { cwd: ws.path, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'], detached: !IS_WIN, windowsHide: true });
+  let answerText = '';
+  const parser = makeParser(t.cli, patch => {
+    for (const e of patch.events || []) if (e.k === 'text') answerText += e.d;
+    emit(patch);
+  });
+  let stderr = '', buf = '';
+  const timer = setTimeout(() => { timedOut = true; killTree(child); }, cfg.taskTimeoutMin * 60000);
+
+  child.stdin.on('error', () => {});
+  child.stdin.end(prompt);
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    buf += chunk;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line) continue;
+      let o; try { o = JSON.parse(line); } catch { emit({ events: [{ k: 'text', d: line + '\n' }] }); continue; }
+      try { parser.line(o); } catch (e) { console.error('[agent] 解析出错', e); }
+    }
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', d => { stderr = (stderr + d).slice(-4000); });
+  child.on('error', e => { clearTimeout(timer); finish({ status: 'failed', error: '启动失败：' + e.message }); });
+  let doneStarted = false;
+  // 兜底：进程已退出，但残留子进程占着输出管道导致 close 迟迟不来
+  child.on('exit', code => setTimeout(() => onDone(code), cancelled ? 800 : 5000));
+  child.on('close', code => onDone(code));
+  const onDone = async code => {
+    clearTimeout(timer);
+    if (ended || doneStarted) return;
+    doneStarted = true;
+    const st = parser.st;
+    let status = 'done', error = null;
+    if (cancelled) { status = 'cancelled'; error = '已手动停止'; }
+    else if (timedOut) { status = 'failed'; error = `超过 ${cfg.taskTimeoutMin} 分钟，已终止`; }
+    else if (st.isError || code !== 0) {
+      status = 'failed';
+      const tail = stderr.split('\n').filter(l => l.trim() && !/Reading (additional )?(input|prompt) from stdin/i.test(l)).slice(-6).join('\n');
+      error = st.errorMsg || tail || `退出码 ${code}`;
+    }
+    try {
+      const { outputs, linkMap, partial } = await collectOutputs(t, ws, before, answerText || st.result || '');
+      if (outputs.length) emit({ outputs, linkMap });
+      if (partial) emit({ events: [{ k: 'info', d: '工作目录文件太多，只检查了前 20000 个文件的变化' }] });
+      if (outputs.length) console.log(`[agent]   产出 ${outputs.length} 个文件`);
+    } catch (e) { console.error('[agent] 收集产出失败', e); }
+    console.log(`[agent] ■ ${new Date().toISOString().slice(11, 23)} ${t.id} ${status}${error ? ' - ' + short(error, 120) : ''}`);
+    finish({ status, result: st.result, error, exitCode: code });
+  };
+}
+
+process.on('SIGINT', () => { for (const j of running.values()) j.cancel(); setTimeout(() => process.exit(0), 800); });
+process.on('SIGTERM', () => { for (const j of running.values()) j.cancel(); setTimeout(() => process.exit(0), 800); });
+loop();

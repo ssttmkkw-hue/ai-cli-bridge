@@ -1,0 +1,112 @@
+# 开发交接文档
+
+给接手继续开发的人（或换台电脑的自己）看：现在做到哪了、代码怎么组织、怎么测、接下来做什么。
+使用和部署说明见根目录 [README.md](../README.md)。
+
+## 当前状态（2026-11-26）
+
+- 在 Windows 上开发和测试，**还没在 Mac 上跑过**。下一步就是在 Mac Air 上走一遍完整流程（见文末清单）。
+- Codex 在 Windows 上实测通过：真实调用、上下文续接、看图片附件、生成文件、停止、只读沙盒拦截。
+- Claude Code 在 Windows 上**没测过真实调用**（这台机器上的独立 `claude.exe` 没登录），只测了「未登录」报错的展示。解析逻辑是按 `stream-json` 格式写的，需要在 Mac 上登录后验证。
+- `dev/smoke-test.mjs` 用模拟 CLI 覆盖 21 项，全部通过。
+
+## 架构
+
+```
+浏览器 ──HTTP──▶ 中继 relay/server.js ◀──长轮询 + POST── 执行端 agent/agent.js ──spawn──▶ claude / codex
+   ▲                    │
+   └──── SSE 推送 ───────┘
+```
+
+- 三个部分都是零依赖 Node（>=18），前端是原生 JS，无构建步骤。
+- 执行端**主动连**中继，所以执行端可以躲在 NAT 后面。
+- 中继单进程、JSON 文件存储，定位是「一个人 + 几个朋友」的规模。
+
+## 代码地图
+
+### relay/server.js（中继）
+| 部分 | 说明 |
+|---|---|
+| 存储 | `config.json`（agent token）、`users.json`、`db.json`（convs / tasks / uploads）、`sessions.json`（登录会话，只存 token 的 sha256）、`files/<id>`（文件本体）。`saveSoon()` 每秒落盘一次 |
+| 用户与权限 | scrypt 密码；`perms = { clis, agents, workspaces, maxLevel, dailyLimit }`，`'*'` 表示全部；`checkRunPerms()` 是建对话 / 发消息时的总闸 |
+| 派发 | `pickTasksFor(agent, free)`：同一对话串行（保证 resume 顺序），派出时带上 `conv.sessionId` 作为 `resumeSessionId`；`wakeAgent()` 立即返回挂着的长轮询 |
+| 停止 | `cancelRequested` + `cancelSentAt`（指令只发一次，10 秒后补发一次）；30 秒还没停，中继直接判为已取消 |
+| 掉线 | 执行端 45 秒没轮询即视为离线；已派发的任务 90 秒没有回音就判失败；中继重启时正在跑的任务判失败 |
+| 文件 | `POST /api/agent/files`（agent 上传产出）、`GET /api/agent/files/:id`（agent 取附件）、`POST /api/uploads`（用户上传，需要 `X-Upload: 1` 头防 CSRF）、`GET /api/files/:id`（只有能看到这个任务的人能访问；HTML/SVG 带 `CSP: sandbox`） |
+| 推送 | `/api/stream` SSE，事件 `task`（任务摘要，不含 events）、`chunk`（新增输出）、`agents`（设备列表） |
+
+### agent/agent.js（执行端）
+| 部分 | 说明 |
+|---|---|
+| 找 CLI | `findBin()`：PATH → 常见安装位置（Mac：`~/.local/bin`、`/opt/homebrew/bin`…；Windows：Claude 桌面 App 自带的、Codex 安装目录）；`versionOf()` 只确认程序能跑，**不确认是否已登录** |
+| 子进程环境 | `childEnv()` 去掉宿主 Claude Code 注入的 `CLAUDE_CODE_*` 等变量；Mac 上补全 PATH（launchd 启动时 PATH 很短） |
+| 命令行 | `buildCommand()`：权限三档 → CLI 参数；prompt 一律走 stdin；Codex 图片附件用 `-i` |
+| 解析输出 | `makeParser()` 把两家的 JSON 行统一成事件 `text / tool / tool_out / think / info / err`，并记下会话 ID |
+| 文件 | `snapshot()` 任务前后各拍一次（跳过 `.git`、`node_modules` 等，上限 2 万个文件，200KB 以下的文本连内容一起记）→ `diffSnapshots()` → `lineDiff()`（LCS）→ 上传；回答里 Markdown 引用的本地文件通过 `localLinks()` + `resolveLocal()` 找到，只允许工作目录内和 `extraOutputDirs` |
+| 附件 | `prepareInputs()` 下载到 `<工作目录>/.ai-bridge/uploads/<任务id>/`，把相对路径追加到 prompt |
+| 停止 | `job.cancel()` 是幂等的；`killTree()`：Windows 用 `taskkill /T /F`，Mac 结束整个进程组；进程退出但 `close` 迟迟不来时有兜底 |
+
+### web/app.js（前端）
+- 状态都在全局 `S` 里；`render()` 画外框，`renderView()` 画当前页。
+- 流式输出只重画对应的那一条回答（`renderTurn`），不动输入框。
+- `md()` 是自己写的极简 Markdown 渲染（先转义再替换，安全）；`linkMap` 把回答里的本地路径换成 `/api/files/<id>`。
+- 文件卡片、预览、diff：`outputsHTML / previewFile / diffHTML`。
+
+## 统一事件格式（执行端 → 中继 → 浏览器）
+
+```js
+{ k: 'text', d: '正文增量' }
+{ k: 'tool', name: 'shell', d: 'ls -la' }
+{ k: 'tool_out', d: '输出片段', err: false }
+{ k: 'think', d: '推理摘要' }        // 目前只有 Codex 有
+{ k: 'info', d: '提示' }
+{ k: 'err', d: '错误' }
+```
+
+## 怎么测
+
+```bash
+npm run local            # 起中继 + 本机执行端（自动生成 agent/agent.local.json，带模拟 CLI）
+node dev/smoke-test.mjs  # 另开终端，21 项冒烟测试，不花额度
+npm run check            # 只做语法检查
+```
+
+- 模拟 CLI 是 `scripts/mock-cli.js`，输出格式和 `codex exec --json` 一样。prompt 里带「slow / 慢」会跑 10 秒（方便测停止），带「文件 / file」会生成 `chart.svg`、`report.html` 并修改 `notes.md`，带「fail / 报错」会失败。
+- 真实 CLI 手动测：网页上新建对话选 Claude / Codex。
+- 预览端口默认 5227；管理员初始密码在 `data/INITIAL_ADMIN.txt`（Mac 上第一次启动会重新生成）。
+
+## 已知问题和坑
+
+- **Codex 回答不逐字输出**：`codex exec --json` 只在整段写完时给出 `agent_message`。要逐字输出需要换成 `codex app-server`。
+- **每条消息都重启 CLI**：会慢几秒，并且要重新读一遍历史。
+- **CLI 是否「可用」只看能不能运行**：没登录的 CLI 也显示可用，发消息时才报错。
+- **同一目录里的并发任务**：两个对话同时改同一个目录，产出文件会混在一起显示。
+- **内置预览面板（Claude 桌面 App）会拦截带 `sandbox` 属性的 iframe**，所以 HTML 预览改由服务端的 `CSP: sandbox` 响应头负责隔离，iframe 上不再加这个属性。普通浏览器两种写法都行。
+- **文件没有自动过期**：`data/files/` 只在删除对话时清理。
+
+## 接下来要做的（按优先级）
+
+1. **在 Mac 上验证**（见下一节清单），特别是 Claude Code 的 `stream-json` 解析和续接。
+2. **显示订阅额度**
+   - Codex：会话记录 `~/.codex/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl` 里的 `token_count` 事件带有 `rate_limits`（`primary` 是 5 小时窗口、`secondary` 是每周窗口，各有 `used_percent` 和 `resets_at`）。已在 Windows 上确认存在。
+   - Claude Code：`stream-json` 输出里有 `type: "rate_limit_event"`，`rate_limit_info` 里有 `status / resetsAt / rateLimitType / utilization`。只在程序代码里看到过，没实际跑出来过，需要在 Mac 上确认什么时候会出现。
+   - 做法：执行端每次任务结束后取额度 → 发给中继 → 「设备」页显示进度条和重置时间，对话顶部加提示。
+3. **在网页上批准操作**：Claude Code 的 `--permission-prompt-tool` 可以把「允许吗？」交给一个 MCP 工具处理，把它接到网页上做成「允许 / 拒绝」按钮。需要先确认它在 `-p` 模式下的行为。
+4. **常驻进程**：Claude 用 `--input-format stream-json`，Codex 用 `app-server`。好处是能中途插话、Codex 能逐字输出、省掉每次启动。
+5. **每条任务自动存档、可撤销**：任务前给工作目录存快照（比如目录是 git 仓库就用 `git stash create` 或单独的分支），网页上加「撤销这次改动」。
+6. 小改进：每条消息临时换模型、代码语法高亮、显示上下文用量、检测 CLI 是否已登录。
+
+## Mac 上的验证清单
+
+- [ ] `brew install node`，`node -v` ≥ 18
+- [ ] `claude` 登录；`codex login`
+- [ ] `npm run local` → 浏览器打开 http://localhost:5227 → 「设备」页 Claude 和 Codex 都显示版本号
+- [ ] `node dev/smoke-test.mjs` 21 项全过
+- [ ] Claude：发两条消息，第二条能接上第一条的上下文（问「我刚才说了什么」）
+- [ ] Claude：「只读问答」下让它改文件，应被拒绝并提示「因权限级别被拒绝」
+- [ ] Claude：「可改文件」下让它新建一个 HTML，网页上能预览
+- [ ] Claude：跑一个长任务点停止，0.5 秒左右停下
+- [ ] 观察 Claude 的 `stream-json` 里有没有 `rate_limit_event`（执行端可以临时打印未识别的事件类型）
+- [ ] `bash mac/install-mac.sh both` 装成开机自启，重启 Mac 后仍能用
+- [ ] 合上屏幕 / 长时间闲置后还在线（`pmset` 设置）
+- [ ] `tailscale serve --bg 5227`，手机上能打开并发消息

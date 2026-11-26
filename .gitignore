@@ -1,0 +1,13 @@
+# 运行时数据：账号密码哈希、agent token、登录会话、对话记录、上传的文件 —— 绝不提交
+data/
+logs/
+
+# 本地测试用的工作目录（AI 在里面读写）
+test-workspaces/
+
+# 每台机器自己的 agent 配置（含 token 和本机路径）
+agent/agent.config.json
+agent/agent.local.json
+
+.DS_Store
+node_modules/
