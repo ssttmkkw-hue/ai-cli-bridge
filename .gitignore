@@ -11,3 +11,7 @@ agent/agent.local.json
 
 .DS_Store
 node_modules/
+
+# Mac 本地会话索引（与 agent 配置放在一起）
+*.sessions.json
+*.sessions.json.*.tmp

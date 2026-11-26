@@ -6,7 +6,8 @@ const os = require('os');
 const path = require('path');
 const { spawn, execFile, execFileSync } = require('child_process');
 
-const VERSION = '1.0.0';
+const { SessionIndex, originalDirectory } = require('./session-index');
+const VERSION = '1.1.0';
 const cfgPath = path.resolve(process.argv[2] || process.env.AGENT_CONFIG || path.join(__dirname, 'agent.config.json'));
 if (!fs.existsSync(cfgPath)) {
   console.error(`[agent] 找不到配置 ${cfgPath}，请复制 agent.config.example.json 改一份`);
@@ -282,6 +283,9 @@ const workspaces = (cfg.workspaces || []).map(w => ({ name: w.name, path: path.r
 for (const w of workspaces) if (!fs.existsSync(w.path)) { fs.mkdirSync(w.path, { recursive: true }); console.log(`[agent] 已创建工作目录 ${w.path}`); }
 if (!workspaces.length) { console.error('[agent] 至少配置一个 workspaces'); process.exit(1); }
 
+const sessions = new SessionIndex(cfgPath + '.sessions.json', workspaces,
+  path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects'));
+
 console.log(`[agent] ${cfg.name} → ${cfg.relayUrl}`);
 for (const [k, c] of Object.entries(clis)) console.log(`[agent]   ${k}: ${c.ok ? '✓ ' + c.version : '✗ 未找到或无法运行'}  ${c.bin || ''}`);
 const authReady = refreshAuth(false).then(() => {
@@ -326,7 +330,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function hello() {
   await api('POST', '/api/agent/hello', {
-    name: cfg.name, platform: process.platform, hostname: os.hostname(), version: VERSION,
+    name: cfg.name, sessionRecovery: true, platform: process.platform, hostname: os.hostname(), version: VERSION,
     maxConcurrent: cfg.maxConcurrent, running: [...running.keys()], confine: CONFINE,
     clis: publicClis(),
     workspaces: workspaces.map(({ name, maxLevel, note, isolate }) => ({ name, maxLevel, note, isolate })),
@@ -465,6 +469,13 @@ async function fsGet(pr) {
   if (!r.ok) throw new Error('上传失败：' + r.status);
 }
 function runProbe(pr) {
+  if (pr.kind === 'resume') {
+    sessions.lookup(pr).then(hit => probeReply(pr.id, hit), e => probeReply(pr.id, null, e.message)); return;
+  }
+  if (pr.kind === 'forgetSession') {
+    try { sessions.forget(pr); probeReply(pr.id, true); } catch (e) { probeReply(pr.id, null, e.message); }
+    return;
+  }
   if (pr.kind === 'ls') { try { probeReply(pr.id, fsList(pr)); } catch (e) { probeReply(pr.id, null, e.message); } return; }
   if (pr.kind === 'get') { fsGet(pr).catch(e => probeReply(pr.id, null, e.message)); return; }
   // 网页发消息时发现 CLI 未登录：马上复查一次（可能刚在 Mac 上登录好）
@@ -731,7 +742,11 @@ async function startTask(t) {
     queueUpdate(t.id, { final }); pollAbort?.abort();
   };
   let cancelled = false, timedOut = false, child = null;
+  if (t.recovered && [...running.values()].some(job => job.convId === t.convId)) {
+    return finish({ status: 'failed', error: '原对话在 Mac 上仍有任务运行，请在完成后重试' });
+  }
   const job = {
+    convId: t.convId,
     cancel() {
       // 幂等：只提示一次；重复收到只是再补一刀
       if (!cancelled) { cancelled = true; console.log(`[agent] ✕ ${new Date().toISOString().slice(11, 23)} 收到停止 ${t.id}`); emit({ events: [{ k: 'info', d: '正在停止…' }] }); }
@@ -747,6 +762,13 @@ async function startTask(t) {
     const lv = ['read', 'edit', 'full'];
     if (lv.indexOf(t.level) > lv.indexOf(ws.maxLevel)) throw new Error('该目录不允许此权限级别');
     ews = { ...ws, path: taskDir(ws, t) };
+    if (t.recovered && t.resumeSessionId) {
+      const dir = originalDirectory(ws, t.username, t.convId);
+      const indexed = sessions.rows[t.convId];
+      if (!dir || (indexed && (indexed.dir !== dir || indexed.ownerKey !== t.ownerKey || indexed.sessionId !== t.resumeSessionId))) {
+        throw new Error('原会话或工作目录已变化，请重新确认会话 ID');
+      }
+    }
     if (!fs.existsSync(ews.path)) {
       fs.mkdirSync(ews.path, { recursive: true });
       // Claude Code 的会话按目录保存：目录刚改成独立子文件夹时，旧会话在新目录里续接不上，只能重新开始
@@ -773,6 +795,10 @@ async function startTask(t) {
   child = spawn(cmd.bin, cmd.args, { cwd: ews.path, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'], detached: !IS_WIN, windowsHide: true });
   let answerText = '';
   const parser = makeParser(t.cli, patch => {
+    if (patch.sessionId && t.ownerKey) {
+      try { sessions.remember(t, ews.path, patch.sessionId); }
+      catch (e) { emit({ events: [{ k: 'info', d: 'Mac 会话索引保存失败：' + e.message }] }); }
+    }
     for (const e of patch.events || []) if (e.k === 'text') answerText += e.d;
     emit(patch);
   });

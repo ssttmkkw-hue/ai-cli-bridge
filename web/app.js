@@ -332,7 +332,11 @@ function renderConvList() {
 }
 async function openConv(id) {
   const r = await tryApi('GET', '/api/convs/' + id);
-  S.conv = r.conv; S.tasks = new Map(r.tasks.map(t => [t.id, t]));
+  showConversation(r);
+}
+function showConversation({ conv, tasks }) {
+  S.conv = conv; S.tasks = new Map(tasks.map(t => [t.id, t]));
+  if (!S.convs.some(c => c.id === conv.id) && conv.userId === S.me.id) S.convs.unshift(conv);
   renderConvList(); renderChat();
 }
 // ---- 新对话：顶部直接选 CLI 和模型，发第一条消息时才创建对话
@@ -405,7 +409,7 @@ function renderChat() {
       <div class="composer-inner">
         <button class="icon-btn attach" id="attachBtn" title="添加附件（也可以粘贴或拖进来）">📎</button>
         <input type="file" id="fileInput" multiple hidden>
-        <textarea id="input" rows="1" placeholder="${c ? `给 ${esc(CLI_NAME[c.cli] || c.cli)} 发消息…` : '发消息开始新对话…'}" title="${esc(sendKeyHint())}"></textarea>
+        <textarea id="input" rows="1" placeholder="${c ? `给 ${esc(CLI_NAME[c.cli] || c.cli)} 发消息…` : '发消息，或输入 id:… 继续旧对话'}" title="${esc(sendKeyHint())}"></textarea>
         <button class="btn primary" id="sendBtn">发送</button>
       </div>
       <div class="hint" id="hint"></div>
@@ -414,7 +418,7 @@ function renderChat() {
   if (c) $('#convMenu').onclick = convMenu; else renderNewChat();
   const inner = $('#msgsInner');
   const tasks = c ? [...S.tasks.values()].sort((a, b) => a.createdAt - b.createdAt) : [];
-  inner.innerHTML = tasks.map(t => `<div class="turn" id="turn-${t.id}"></div>`).join('');
+  inner.innerHTML = (c?.recovered ? '<div class="empty">已从 Mac 找回会话。此页显示恢复后的消息。</div>' : '') + tasks.map(t => `<div class="turn" id="turn-${t.id}"></div>`).join('');
   tasks.forEach(t => renderTurn(t.id));
   scrollBottom(true);
   const ta = $('#input');
@@ -523,22 +527,48 @@ function scrollBottom(force) {
   if (force || m.scrollHeight - m.scrollTop - m.clientHeight < 160) m.scrollTop = m.scrollHeight;
 }
 async function sendMsg() {
-  const ta = $('#input'); const v = ta.value.trim();
+  let ta = $('#input');
+  if (!ta || $('#sendBtn').disabled) return;
+  let v = ta.value.trim();
   if (/^\/(usage|额度)$/i.test(v)) { ta.value = ''; showUsageInChat(); return; } // 查额度，不发给 AI
   const atts = S.pending.filter(p => p.convId === S.conv?.id);
   if (!v && !atts.length) return;
   if (atts.some(p => p.uploading)) return toast('附件还在上传，稍等一下');
+  const resume = (!S.conv || !S.tasks.size) && /^id[:：][ \t]*(\S*)(?:\s+([\s\S]*))?$/i.exec(v);
+  if (resume && atts.length) return toast('请先移除附件，接续旧对话后再添加', true);
   $('#sendBtn').disabled = true;
   try {
+    if (resume) {
+      let r = await tryApi('POST', '/api/resume', { id: resume[1] });
+      if ($('#input') !== ta) return;
+      if (r.choices) {
+        const choices = r.choices.map((c, i) => `${i + 1}. ${fmtTime(c.at)} · ${c.workspace} · ${c.sessionId}`);
+        const n = window.prompt('这个目录有多个 Claude 会话，请输入序号：\n' + choices.join('\n'));
+        if (n === null) return;
+        const choice = r.choices[Number(n) - 1];
+        if (!choice) return toast('序号无效，原消息已保留', true);
+        r = await tryApi('POST', '/api/resume', { id: resume[1], choice });
+        if (!r.conv) return toast('会话列表已变化，请重新选择', true);
+      }
+      if ($('#input') !== ta) return; // 查询期间用户已经切到别的对话
+      showConversation(r);
+      ta = $('#input');
+      v = (resume[2] || '').trim();
+      ta.value = v;
+      if (!v) { toast('已打开旧对话'); return; }
+      $('#sendBtn').disabled = true;
+    }
     if (!S.conv) await ensureConv(v.replace(/\s+/g, ' ').slice(0, 30) || '新对话'); // 新对话：发第一条时才创建
-    const r = await tryApi('POST', `/api/convs/${S.conv.id}/send`, { prompt: v, attachments: atts.map(p => p.id) });
+    const convId = S.conv.id;
+    const r = await tryApi('POST', `/api/convs/${convId}/send`, { prompt: v, attachments: atts.map(p => p.id) });
     atts.forEach(p => p.thumb && URL.revokeObjectURL(p.thumb));
     S.pending = S.pending.filter(p => !atts.includes(p));
+    if (S.conv?.id !== convId) return;
     if (!S.tasks.has(r.task.id)) S.tasks.set(r.task.id, { ...r.task, events: [] });
     const c = S.convs.find(x => x.id === S.conv.id); if (c) { c.updatedAt = Date.now(); if (c.title === '新对话' && v) { c.title = v.slice(0, 30); S.conv.title = c.title; } }
     ta.value = '';
-    renderChat(); renderConvList(); scrollBottom(true);
-  } catch { /* tryApi 已经提示过 */ } finally { const b = $('#sendBtn'); if (b) b.disabled = false; $('#input')?.focus(); }
+    renderChat(); renderConvList(); scrollBottom(true); $('#input')?.focus();
+  } catch { /* tryApi 已经提示过 */ } finally { if ($('#input') === ta) { $('#sendBtn').disabled = false; ta.focus(); } }
 }
 
 // ---- 文件：图标、卡片、预览、diff

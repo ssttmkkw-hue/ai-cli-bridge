@@ -177,6 +177,11 @@ const GUEST_PERMS = () => ({
   maxLevel: LEVELS.includes(process.env.GUEST_MAX_LEVEL) ? process.env.GUEST_MAX_LEVEL : 'edit', // 默认不给「完全放开」
   dailyLimit: Math.max(0, Number(process.env.GUEST_DAILY_LIMIT ?? 50) || 0),
 });
+// 环境账号重建后 user.id 会改变。同一访客档位换租（默认换密码）必须获得不同的恢复身份。
+function recoveryOwner(u) {
+  const rental = u.env?.startsWith('GUEST') ? (process.env[u.env + '_RENTAL_ID'] || process.env[u.env + '_PASSWORD']) : '';
+  return crypto.createHmac('sha256', config.agentToken).update(JSON.stringify([u.env || u.id, rental])).digest('hex');
+}
 function kickUser(id) { for (const [k, s] of sessions) if (s.userId === id) sessions.delete(k); }
 // 环境变量账号的问题：除了写日志，也放在「用户权限」页顶部给管理员看（不用去部署平台翻日志）
 const envWarnings = [];
@@ -221,6 +226,12 @@ function syncEnvAccounts() {
     }
     if (u.username !== name || u.disabled) { u.username = name; u.disabled = false; changed = true; }
     if (setPw(u, pw)) console.log(`[relay] 账号 ${name} 的密码已按环境变量更新`);
+  }
+  for (const u of users.filter(u => u.env?.startsWith('GUEST') && !u.disabled)) {
+    const lease = recoveryOwner(u);
+    if (u.lease === lease) continue;
+    if (u.lease) { kickUser(u.id); u.id = newId('u'); u.perms = GUEST_PERMS(); }
+    u.lease = lease; changed = true;
   }
   if (changed) writeJSONAtomic(files.users, users);
 }
@@ -335,12 +346,17 @@ function pickTasksFor(agent, free) {
     }
     const conv = convOf(t);
     if (!conv) { t.status = 'cancelled'; continue; }
+    const owner = users.find(u => u.id === conv.userId && !u.disabled);
+    if (!owner) { t.status = 'failed'; t.error = '原账号已停用或租期已结束'; t.endedAt = Date.now(); saveSoon(); pushTask(t); continue; }
+    t.revision = conv.revision || 0;
+    if (agent.sessionRecovery) conv.indexAgent = true;
     t.status = 'dispatched'; t.dispatchedAt = Date.now(); delete t.waitingFor;
     t.resumeSessionId = conv.sessionId || null;
     busyConvs.add(t.convId); if (!isoWs.has(t.workspace)) busyWs.add(t.workspace);
     out.push({
       id: t.id, convId: t.convId, username: userName(t.userId), cli: t.cli, prompt: t.prompt, workspace: t.workspace, level: t.level,
       model: t.model || null, resumeSessionId: t.resumeSessionId,
+      ownerKey: recoveryOwner(owner), revision: t.revision, recovered: !!conv.recovered, title: conv.title,
       inputs: (t.inputs || []).map(f => ({ id: f.id, name: f.name, mime: f.mime, size: f.size })),
     });
     pushTask(t);
@@ -434,7 +450,7 @@ async function handle(req, res) {
       if (!b.name) fail(400, '缺少 name');
       const old = agents.get(b.name);
       const a = {
-        name: String(b.name).slice(0, 40), platform: b.platform, hostname: b.hostname, version: b.version,
+        name: String(b.name).slice(0, 40), platform: b.platform, hostname: b.hostname, version: b.version, sessionRecovery: b.sessionRecovery === true,
         clis: sanitizeClis(b.clis), workspaces: b.workspaces || [], maxConcurrent: b.maxConcurrent || 1, confine: !!b.confine,
         quota: old?.quota || null, probes: old?.probes || [], // 订阅额度（最近一次）、待执行的即时查询
         lastSeen: Date.now(), running: old?.running || new Set(), waiter: null,
@@ -537,7 +553,7 @@ async function handle(req, res) {
         }
         if (up.sessionId) {
           t.sessionId = up.sessionId;
-          const c = convOf(t); if (c) c.sessionId = up.sessionId;
+          const c = convOf(t); if (c && (c.revision || 0) === (t.revision || 0)) c.sessionId = up.sessionId;
         }
         if (up.usage) t.usage = up.usage;
         if (up.outputs) t.outputs = sanitizeOutputs(up.outputs, t);
@@ -651,6 +667,21 @@ async function handle(req, res) {
       .map(c => ({ ...c, username: userName(c.userId) }));
     return send(res, 200, { convs: list });
   }
+  if (p === '/api/resume' && (m === 'GET' || m === 'POST')) {
+    const b = m === 'POST' ? await readBody(req) : {};
+    const id = String(b.id || url.searchParams.get('id') || '').trim().toLowerCase();
+    if (!/^(?:c_[0-9a-f]{12}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/.test(id)) {
+      fail(400, '请复制完整的会话 ID，例如 id:c_0123456789ab');
+    }
+    let c = db.convs.find(c => c.userId === user.id && (c.id === id || c.sessionId?.toLowerCase() === id));
+    if (!c && m === 'POST') {
+      const found = await recoverConversation(user, id, b.choice);
+      if (found.choices) return send(res, 200, { choices: found.choices });
+      c = found.conv;
+    }
+    if (!c) fail(404, '当前账号找不到这个会话，请检查 ID 和登录账号');
+    return send(res, 200, { conv: c, tasks: db.tasks.filter(t => t.convId === c.id) });
+  }
   if (p === '/api/convs' && m === 'POST') {
     const b = await readBody(req);
     checkRunPerms(user, b);
@@ -672,13 +703,19 @@ async function handle(req, res) {
     }
     if (m === 'PATCH') {
       const b = await readBody(req);
+      if (b.level) checkRunPerms(user, { ...c, level: b.level });
+      if (b.resetSession) {
+        await forgetOnMac(c, false);
+        c.revision = (c.revision || 0) + 1;
+        c.sessionId = null;
+      }
       if (b.title) c.title = String(b.title).slice(0, 60);
       if ('model' in b) c.model = b.model ? String(b.model).slice(0, 100) : null; // 换模型不影响上下文续接
-      if (b.level) { checkRunPerms(user, { ...c, level: b.level }); c.level = b.level; }
-      if (b.resetSession) c.sessionId = null;
+      if (b.level) c.level = b.level;
       saveSoon(); return send(res, 200, { conv: c });
     }
     if (m === 'DELETE') {
+      await forgetOnMac(c, true);
       for (const t of db.tasks) if (t.convId === c.id && ['running', 'dispatched'].includes(t.status) && !t.cancelRequested) { t.cancelRequested = true; t.cancelRequestedAt = Date.now(); wakeAgent(t.agent); }
       db.convs = db.convs.filter(x => x !== c);
       for (const t of db.tasks) if (t.convId === c.id && !['running', 'dispatched'].includes(t.status)) { removeBlobs(t.outputs); removeBlobs(t.inputs); }
@@ -880,6 +917,61 @@ async function handle(req, res) {
   }
 
   fail(404, 'no route');
+}
+
+async function recoverConversation(user, id, choice) {
+  const available = [...agents.values()].filter(a => allow(user.perms.agents, a.name));
+  const devices = available.filter(a => a.sessionRecovery && agentOnline(a));
+  if (!devices.length) fail(503, '需要 Mac 在线并运行支持会话恢复的新版 agent');
+  const ownerKey = recoveryOwner(user);
+  const replies = await Promise.all(devices.map(async a => {
+    const workspaces = a.workspaces.filter(w => allow(user.perms.workspaces, w.name)).map(w => w.name);
+    const r = await requestProbe(a, { kind: 'resume', key: id, ownerKey, username: user.username,
+      legacyAdmin: user.env === 'ADMIN' && user.role === 'admin' && allow(user.perms.clis, 'claude'),
+      workspaces, choice: choice?.agent === a.name ? choice : null }, 10000);
+    return { agent: a.name, ...r };
+  }));
+  const error = replies.find(r => r.error);
+  if (error) fail(503, error.error);
+  const hits = replies.filter(r => r.result);
+  if (!hits.length) fail(404, '当前账号在中继和在线 Mac 上都找不到这个会话');
+  if (hits.length !== 1) fail(409, '多台 Mac 返回了同一个 ID，请检查设备配置');
+  const { agent, result } = hits[0];
+  if (result.choices) return { choices: result.choices.map(c => ({ ...c, agent })) };
+  const r = result.conv;
+  if (!r || !/^c_[0-9a-f]{12}$/.test(r.id) || (r.id !== id && r.sessionId !== id)) fail(502, 'Mac 返回的会话不匹配');
+  const ws = agents.get(agent)?.workspaces.find(w => w.name === r.workspace);
+  if (!ws || !LEVELS.includes(r.level)) fail(409, '原工作目录或权限已变化');
+  const level = LEVELS[Math.min(...[r.level, ws.maxLevel || 'read', user.perms.maxLevel].map(l => LEVELS.indexOf(l)))];
+  const c = { id: r.id, userId: user.id, title: r.title || '找回的旧对话', agent, level, cli: r.cli,
+    model: r.model || null, workspace: r.workspace, sessionId: r.sessionId, revision: r.revision || 0,
+    indexAgent: true, recovered: true, createdAt: Date.now(), updatedAt: Date.now() };
+  checkRunPerms(user, c);
+  const existing = db.convs.find(x => x.id === c.id);
+  if (existing) {
+    if (existing.userId !== user.id) fail(404, '找不到这个会话');
+    if (existing.sessionId !== c.sessionId) fail(409, '会话已发生变化，请重新打开');
+    return { conv: existing };
+  }
+  db.convs.push(c); saveSoon();
+  return { conv: c };
+}
+
+// 先让 Mac 记住作废状态，再确认删除/清空，避免下次部署把旧会话重新找回来。
+const invalidating = new Set();
+async function forgetOnMac(c, remove) {
+  const a = agents.get(c.agent);
+  if (!c.indexAgent && (!a?.sessionRecovery || !c.sessionId)) return;
+  if (!a?.sessionRecovery || !agentOnline(a)) fail(503, '请在 Mac 执行端上线后再清空或删除此对话');
+  const owner = users.find(u => u.id === c.userId);
+  if (!owner) return; // 已结束的租期不再具有可登录的恢复身份
+  if (invalidating.has(c.id)) fail(409, '正在更新此对话，请稍后再试');
+  invalidating.add(c.id);
+  try {
+    const r = await requestProbe(a, { kind: 'forgetSession', ownerKey: recoveryOwner(owner), convId: c.id,
+      revision: (c.revision || 0) + 1, remove }, 10000);
+    if (r.result !== true) fail(503, r.error || 'Mac 未能更新会话索引');
+  } finally { invalidating.delete(c.id); }
 }
 
 function visibleAgents(user) {
